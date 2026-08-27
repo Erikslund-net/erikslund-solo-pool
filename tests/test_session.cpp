@@ -34,6 +34,7 @@ struct SessionTestPeek {
 namespace {
 
 const Bytes kPayoutScript = util::from_hex("0014751e76e8199196d454941c45d1b3a323f1433bd6");
+const Bytes kOtherPayoutScript = util::from_hex("00140000000000000000000000000000000000000001");
 
 std::shared_ptr<Job> make_fake_job(uint32_t curtime) {
     gbt_json t = gbt_json::object_t{};
@@ -87,6 +88,8 @@ public:
     bool block_found = false;
     std::function<void()> block_found_hook;
     bool vardiff = false;
+    double minimum_difficulty = 0.001;
+    double maximum_difficulty = 0.0;
 
     explicit FakePool(uint32_t curtime) : job(make_fake_job(curtime)) {}
 
@@ -94,13 +97,17 @@ public:
     std::shared_ptr<const RuntimeConfig> runtime_config() const override {
         Config config;
         config.initial_difficulty = 1e-9;
+        config.minimum_difficulty = minimum_difficulty;
+        config.maximum_difficulty = maximum_difficulty;
         config.variable_difficulty = vardiff;
         return std::make_shared<const RuntimeConfig>(config.runtime_config());
     }
     double start_difficulty() const { return runtime_config()->initial_difficulty; }
     std::optional<Bytes> validate_address(const std::string& address) override {
-        if (address == "validaddr")
+        if (address == "validaddr" || address == "VALIDADDR")
             return kPayoutScript;
+        if (address == "othervalidaddr")
+            return kOtherPayoutScript;
         return std::nullopt;
     }
     std::shared_ptr<const Job> current_job() const override { return job; }
@@ -164,9 +171,10 @@ struct Fixture {
     void subscribe() {
         session.handle_line(R"({"id":1,"method":"mining.subscribe","params":["miner/1.0"]})");
     }
-    void authorize(const std::string& user) {
+    void authorize(const std::string& user, std::string_view password = "x") {
         session.handle_line(
-            std::format(R"({{"id":3,"method":"mining.authorize","params":["{}","x"]}})", user));
+            std::format(R"({{"id":3,"method":"mining.authorize","params":["{}","{}"]}})",
+                        user, password));
     }
 };
 
@@ -220,6 +228,42 @@ TEST_CASE("authorize accepts a valid address and pushes difficulty + a job") {
     CHECK(f.conn.by_method("mining.notify").has_value());
 }
 
+TEST_CASE("authorize adopts password difficulty before sending initial work") {
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker1", "d=1000000");
+
+    CHECK(fixture.session.difficulty() == doctest::Approx(1'000'000.0));
+    const auto difficulty = fixture.conn.by_method("mining.set_difficulty");
+    REQUIRE(difficulty.has_value());
+    CHECK((*difficulty)["params"][0].get<double>() == doctest::Approx(1'000'000.0));
+    CHECK(fixture.conn.by_method("mining.notify").has_value());
+}
+
+TEST_CASE("authorize accepts diff password tokens and clamps them to the configured range") {
+    Fixture fixture;
+    fixture.pool.minimum_difficulty = 10.0;
+    fixture.pool.maximum_difficulty = 500'000.0;
+    fixture.authorize("validaddr.worker1", "c=BTC, diff=1000000");
+
+    CHECK(fixture.session.difficulty() == doctest::Approx(500'000.0));
+}
+
+TEST_CASE("authorize accepts the MRR diff_ password difficulty") {
+    Fixture fixture;
+    fixture.authorize("validaddr.worker1", "diff_524000");
+
+    CHECK(fixture.session.difficulty() == doctest::Approx(524'000.0));
+}
+
+TEST_CASE("authorize ignores malformed password difficulty") {
+    Fixture fixture;
+    const double initial_difficulty = fixture.session.difficulty();
+    fixture.authorize("validaddr.worker1", "d=1000oops");
+
+    CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty));
+}
+
 TEST_CASE("authorize allows an empty or absent worker name (address only)") {
     {
         Fixture f; // no worker name at all: just the payout address, no dot
@@ -255,6 +299,69 @@ TEST_CASE("authorize rejects an invalid address") {
     CHECK_FALSE(f.session.authorized());
 }
 
+TEST_CASE("re-authorize to a DIFFERENT payout address on one connection is refused") {
+    // One SV1 connection carries one payout identity: mining.notify sends a single coinbase2 built
+    // from the session payout script. Adopting a second address would credit -- and on a solved
+    // block PAY -- the wrong miner for every share that followed.
+    Fixture f;
+    f.subscribe();
+    f.authorize("validaddr.w1");
+    REQUIRE(f.session.authorized());
+    REQUIRE(f.session.address().has_value());
+    const std::string first = *f.session.address();
+
+    f.session.handle_line(
+        R"({"id":9,"method":"mining.authorize","params":["othervalidaddr.w2","x"]})");
+    const auto reply = f.conn.by_id(9);
+    REQUIRE(reply.has_value());
+    CHECK((*reply)["result"].get<bool>() == false);
+    // The original identity survives intact.
+    CHECK(f.session.authorized());
+    CHECK(*f.session.address() == first);
+    CHECK(*f.session.worker() == "w1");
+    REQUIRE(f.pool.attached.size() == 1);
+    CHECK(f.pool.attached.front().first == "validaddr");
+    CHECK(f.pool.attached.front().second == "w1");
+}
+
+TEST_CASE("re-authorize to the SAME address rebinds the worker name") {
+    Fixture f;
+    f.subscribe();
+    f.authorize("validaddr.w1");
+    f.authorize("validaddr.w2");
+    CHECK(f.session.authorized());
+    CHECK(*f.session.address() == "validaddr");
+    CHECK(*f.session.worker() == "w2"); // same payout address -> worker rebind still allowed
+}
+
+TEST_CASE("re-authorize preserves one accounting identity across equivalent address spellings") {
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.w1");
+    fixture.session.handle_line(
+        R"({"id":9,"method":"mining.authorize","params":["VALIDADDR.w2","x"]})");
+
+    const auto reply = fixture.conn.by_id(9);
+    REQUIRE(reply.has_value());
+    CHECK((*reply)["result"].get<bool>() == true);
+    CHECK(*fixture.session.address() == "validaddr");
+    CHECK(*fixture.session.worker() == "w2");
+    REQUIRE(fixture.pool.attached.size() == 2);
+    CHECK(fixture.pool.attached.back().first == "validaddr");
+    CHECK(fixture.pool.attached.back().second == "w2");
+}
+
+TEST_CASE("a submit username does not replace the connection's authorized identity") {
+    Fixture f;
+    f.subscribe();
+    f.authorize("validaddr.w");
+    f.session.handle_line(
+        R"({"id":41,"method":"mining.submit","params":["othervalidaddr.w","nope","01020304","00000000","00000000"]})");
+    const auto reply = f.conn.by_id(41);
+    REQUIRE(reply.has_value());
+    CHECK((*reply)["error"][0].get<double>() == 21); // stale, not unauthorized
+}
+
 TEST_CASE("submit before authorize is rejected as unauthorized") {
     Fixture f;
     f.subscribe();
@@ -276,7 +383,7 @@ TEST_CASE("submit to an unknown job is stale") {
     CHECK((*reply)["error"][0].get<double>() == 21); // stale
 }
 
-TEST_CASE("a valid block share is dispatched, counted, and deduplicated") {
+TEST_CASE("a valid block share with mismatched username is dispatched, counted, and deduplicated") {
     Fixture f;
     f.subscribe();
     f.authorize("validaddr.w");
@@ -293,7 +400,7 @@ TEST_CASE("a valid block share is dispatched, counted, and deduplicated") {
     REQUIRE_FALSE(nonce.empty());
 
     const std::string submit = std::format(
-        R"({{"id":6,"method":"mining.submit","params":["w","job1","01020304","{}","{}"]}})",
+        R"({{"id":6,"method":"mining.submit","params":["othervalidaddr.w","job1","01020304","{}","{}"]}})",
         f.pool.job->ntime_hex(), nonce);
 
     f.session.handle_line(submit);
@@ -800,13 +907,15 @@ TEST_CASE("submit with too few params is an other-error") {
     CHECK((*reply)["error"][0].get<double>() == 20); // ERR_OTHER (needs >= 5 params)
 }
 
-TEST_CASE("mining.extranonce.subscribe is acknowledged") {
+TEST_CASE("mining.extranonce.subscribe is answered false, matching mining.configure") {
     Fixture f;
     f.subscribe();
     f.session.handle_line(R"({"id":11,"method":"mining.extranonce.subscribe","params":[]})");
     const auto reply = f.conn.by_id(11);
     REQUIRE(reply.has_value());
-    CHECK((*reply)["result"].get<bool>() == true);
+    // The pool never sends mining.set_extranonce, and handle_configure reports
+    // subscribe-extranonce false; a bare true here would contradict that.
+    CHECK((*reply)["result"].get<bool>() == false);
 }
 
 TEST_CASE("an unknown method with an id gets an other-error; with a null id, silence") {

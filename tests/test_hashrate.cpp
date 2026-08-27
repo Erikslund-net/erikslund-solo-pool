@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cmath>
+#include <numbers>
 #include <span>
 #include <string>
 
@@ -9,40 +10,36 @@
 
 using namespace erikslund::stats;
 
-namespace {
-// The exact decay_time formula, recomputed independently so the test pins the math.
-double expected_decay(double value, double addend, double elapsed, double interval) {
-    const double exponent = std::min(elapsed / interval, 36.0);
-    const double proportion = 1.0 - 1.0 / std::exp(exponent);
-    return (value + (addend / elapsed) * proportion) / (1.0 + proportion);
-}
-} // namespace
-
-TEST_CASE("decay_time returns the value unchanged for a non-positive interval") {
+TEST_CASE("decay_time returns the value unchanged for non-positive elapsed time") {
     CHECK(decay_time(5.0, 100.0, 0.0, 60.0) == doctest::Approx(5.0));
     CHECK(decay_time(5.0, 100.0, -1.0, 60.0) == doctest::Approx(5.0));
 }
 
-TEST_CASE("decay_time matches the closed-form folding formula") {
-    CHECK(decay_time(0.0, 120.0, 60.0, 60.0) ==
-          doctest::Approx(expected_decay(0.0, 120.0, 60.0, 60.0)));
-    CHECK(decay_time(3.5, 90.0, 30.0, 300.0) ==
-          doctest::Approx(expected_decay(3.5, 90.0, 30.0, 300.0)));
+TEST_CASE("decay_time folds an observed rate over one time constant") {
+    const double aged = decay_time(0.0, 120.0, 60.0, 60.0);
+    CHECK(aged == doctest::Approx(2.0 * (1.0 - 1.0 / std::numbers::e)));
 }
 
-TEST_CASE("decay_time with a zero addend strictly shrinks the value") {
+TEST_CASE("decay_time preserves a steady observed rate") {
+    CHECK(decay_time(2.0, 120.0, 60.0, 60.0) == doctest::Approx(2.0));
+}
+
+TEST_CASE("decay_time applies one time constant of exponential decay") {
     const double aged = decay_time(10.0, 0.0, 60.0, 60.0);
-    CHECK(aged < 10.0);
-    CHECK(aged > 0.0);
-    CHECK(aged == doctest::Approx(expected_decay(10.0, 0.0, 60.0, 60.0)));
+    CHECK(aged == doctest::Approx(10.0 / std::numbers::e));
 }
 
-TEST_CASE("decay_time clamps the exponent so a huge gap cannot overflow") {
-    // elapsed/interval = 1e9 is clamped to 36; proportion -> ~1, so no inf/nan.
+TEST_CASE("decay_time approaches zero across a huge idle gap") {
     const double aged = decay_time(10.0, 0.0, 1e9, 1.0);
     CHECK(std::isfinite(aged));
-    // With proportion ~1, value/(1+1) ~ 5.
-    CHECK(aged == doctest::Approx(10.0 / 2.0).epsilon(0.001));
+    CHECK(aged == 0.0);
+}
+
+TEST_CASE("decay_time composes across idle intervals") {
+    const double aged_once = decay_time(10.0, 0.0, 120.0, 60.0);
+    const double aged_twice =
+        decay_time(decay_time(10.0, 0.0, 30.0, 60.0), 0.0, 90.0, 60.0);
+    CHECK(aged_twice == doctest::Approx(aged_once));
 }
 
 TEST_CASE("DecayingWindows starts at zero for every window") {
@@ -79,8 +76,7 @@ TEST_CASE("snapshot ages the rate further as time passes without new shares") {
     windows.add(1000.0, 60.0);
     const auto at_share = windows.snapshot(60.0);
     const auto later = windows.snapshot(3600.0); // an hour later, no new shares
-    // The 1m window decays toward zero.
-    CHECK(later[0] < at_share[0]);
+    CHECK(later[0] < at_share[0] * 1e-20);
     CHECK(later[0] >= 0.0);
 }
 
@@ -91,6 +87,14 @@ TEST_CASE("snapshot does not mutate internal state (idempotent reads)") {
     const auto second = windows.snapshot(30.0);
     for (size_t i = 0; i < first.size(); ++i)
         CHECK(first[i] == doctest::Approx(second[i]));
+}
+
+TEST_CASE("seed ages recovered rates across downtime") {
+    DecayingWindows<7> windows(std::span<const int, 7>(kHashrateWindows), 100.0);
+    std::array<double, 7> recovered_rates{};
+    recovered_rates.fill(100.0);
+    windows.seed(recovered_rates, 100.0, 60.0);
+    CHECK(windows.snapshot(100.0)[0] == doctest::Approx(100.0 / std::numbers::e));
 }
 
 TEST_CASE("the SPS window set has the documented sizes and labels") {

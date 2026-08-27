@@ -32,9 +32,9 @@ inline constexpr double kHashesPerDiff1Share = 4294967296.0;
 inline double decay_time(double value, double addend, double elapsed, double interval) {
     if (elapsed <= 0.0)
         return value;
-    const double exponent = std::min(elapsed / interval, 36.0); // clamp to avoid exp overflow
-    const double proportion = 1.0 - 1.0 / std::exp(exponent);
-    return (value + (addend / elapsed) * proportion) / (1.0 + proportion);
+    const double decay = std::exp(-elapsed / interval);
+    const double observed_rate = addend / elapsed;
+    return value * decay + observed_rate * (1.0 - decay);
 }
 
 // Decaying rates, one per window. The owner guards add()/snapshot() with its lock.

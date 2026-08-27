@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <ctime>
 #include <format>
@@ -41,6 +42,42 @@ void append_canonical_hex(std::string& out, std::string_view value, size_t width
 const std::string& or_empty(const std::optional<std::string>& value) {
     static const std::string kEmpty;
     return value ? *value : kEmpty;
+}
+
+std::string_view trim_spaces(std::string_view text) {
+    const std::size_t first = text.find_first_not_of(" \t");
+    if (first == std::string_view::npos)
+        return {};
+    const std::size_t last = text.find_last_not_of(" \t");
+    return text.substr(first, last - first + 1);
+}
+
+std::optional<double> difficulty_from_password(std::string_view password) {
+    while (!password.empty()) {
+        const std::size_t separator = password.find(',');
+        const std::string_view token = trim_spaces(password.substr(0, separator));
+
+        std::string_view value;
+        if (token.starts_with("d="))
+            value = trim_spaces(token.substr(2));
+        else if (token.starts_with("diff=") || token.starts_with("diff_"))
+            value = trim_spaces(token.substr(5));
+
+        if (!value.empty()) {
+            const std::string text(value);
+            double difficulty = 0.0;
+            const char* const end = text.data() + text.size();
+            if (const auto [position, error] =
+                    std::from_chars(text.data(), end, difficulty);
+                error == std::errc{} && position == end)
+                return difficulty;
+        }
+
+        if (separator == std::string_view::npos)
+            break;
+        password.remove_prefix(separator + 1);
+    }
+    return std::nullopt;
 }
 } // namespace
 
@@ -222,7 +259,7 @@ void Session::dispatch(const Request& request) {
     else if (method == "mining.suggest_difficulty")
         handle_suggest_difficulty(request);
     else if (method == "mining.extranonce.subscribe")
-        send_result(request.id, true);
+        send_result(request.id, false);
     else if (!request.id.is_null())
         connection_.send_line(make_error_line(request.id, ERR_OTHER));
 }
@@ -363,10 +400,15 @@ void Session::handle_authorize(const json& id, const std::vector<std::string>& p
         send_result(id, false);
         return;
     }
-    // Re-authorize may change the payout address; the cached coinbase2 is keyed only by job_id,
-    // so drop it.
-    if (payout_script_ != script)
-        coinbase2_cache_.reset();
+    if (authorized_ && payout_script_ && *payout_script_ != *script) {
+        log::warning("Refusing re-authorize on {}: payout address {} -> {} on one connection",
+                     connection_.peer(), or_empty(address_), address); // sanitized at ingress
+        send_result(id, false);
+        return;
+    }
+    // Keep the first spelling so equivalent Bech32 forms share one accounting identity.
+    if (authorized_ && address_)
+        address = *address_;
     address_ = std::move(address);
     // Gate the worker to ASCII from the raw suffix: ascii_only drops non-ASCII so the
     // ASCII-only users/<address> file cannot be corrupted while preserving worker identity.
@@ -375,6 +417,22 @@ void Session::handle_authorize(const json& id, const std::vector<std::string>& p
                                            : log::ascii_only(params[0].substr(raw_dot + 1));
     payout_script_ = std::move(script);
     authorized_ = true;
+
+    if (params.size() > 1) {
+        const auto config = pool_.runtime_config();
+        if (const auto requested = difficulty_from_password(params[1]); requested) {
+            const auto clamped = clamp_suggested_difficulty(
+                *requested, config->minimum_difficulty, config->maximum_difficulty);
+            if (clamped && *clamped != difficulty_) {
+                begin_difficulty_change(*clamped);
+                shares_since_retarget_ = 0;
+                last_retarget_ = stats::steady_seconds();
+                log::info("Password difficulty {} -> {}", connection_.peer(),
+                          util::format_difficulty(*clamped));
+            }
+        }
+    }
+
     // Register the worker so an idle authorized rig shows up (and persists) in the stats even
     // before its first share.
     worker_accounting_ = pool_.attach_worker(*address_, *worker_);
