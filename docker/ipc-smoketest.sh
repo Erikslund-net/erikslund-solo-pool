@@ -22,7 +22,7 @@ BUILD_VOLUME=ep-ipc-smoke-build
 DATA_VOLUME=ep-ipc-smoke-data
 SOCKET_VOLUME=ep-ipc-smoke-socket
 MINING_ADDRESS=bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf
-POOL_RPC_METHODS=getblockchaininfo,getbestblockhash,getblockheader,submitblock
+POOL_RPC_METHODS=getblockchaininfo,getconnectioncount,getbestblockhash,getblockheader,submitblock
 POOL_RPC_METHODS+=,getblockcount,getblockhash,getblock,getblockstats
 POOL_RPC_METHODS+=,createwallet,loadwallet,getnewaddress,sendtoaddress
 POOL_RPC_METHODS+=,generatetoaddress,getrawmempool
@@ -238,12 +238,12 @@ RECOVERY_TXID="$(pool_cli -rpcwallet=ipc-smoke sendtoaddress "$RECOVERY_RECIPIEN
 echo "==> 8/9 require RPC fallback, then a fresh transaction-bearing IPC job"
 for _ in $(seq 1 30); do
     POOL_LOGS="$(docker logs "$POOL" 2>&1 || true)"
-    if [[ "$POOL_LOGS" == *"IPC fetch_template failed"* ]] && rpc_is_active; then
+    if [[ "$POOL_LOGS" == *"IPC work unavailable"* ]] && rpc_is_active; then
         break
     fi
     sleep 1
 done
-[[ "${POOL_LOGS:-}" == *"IPC fetch_template failed"* ]] ||
+[[ "${POOL_LOGS:-}" == *"IPC work unavailable"* ]] ||
     fail "pool did not observe the broken IPC session"
 rpc_is_active || fail "pool did not expose RPC as active during IPC reconnect"
 

@@ -31,6 +31,17 @@
 using namespace erikslund;
 using namespace erikslund::test;
 
+namespace erikslund::sv2 {
+struct SessionTestPeek {
+    static void seed_extranonce(Session& session, uint64_t value) {
+        session.extranonce_counter_ = value;
+    }
+    static void seed_job_id(Session& session, uint32_t value) {
+        session.next_job_id_ = value;
+    }
+};
+} // namespace erikslund::sv2
+
 namespace {
 
 const Bytes kPayoutScript =
@@ -258,6 +269,82 @@ TEST_CASE("SV2 opens a Standard Channel with the mandatory initial work order") 
     CHECK(sv2::decode_open_mining_channel_error(frames[0].payload).error_code ==
           "channel-limit-reached");
     CHECK(session.protocol_errors() == 0);
+}
+
+TEST_CASE("SV2 refuses channel type changes even after all channels close") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    for (const bool standard_first : {true, false}) {
+        FakePool pool(now);
+        FakeConnection connection;
+        sv2::Session session(pool, connection, util::from_hex("01020304"));
+        setup(session, sv2::kSetupFlagRequiresVersionRolling);
+        connection.take_frames();
+        if (standard_first)
+            open_channel(session);
+        else
+            open_extended_channel(session);
+        REQUIRE(session.authorized());
+        connection.take_frames();
+        session.handle_bytes(sv2::encode_message(sv2::CloseChannel{1, "done"}));
+        CHECK_FALSE(session.authorized());
+        if (standard_first)
+            open_extended_channel(session);
+        else
+            open_channel(session);
+        const auto frames = connection.take_frames();
+        REQUIRE(frames.size() == 1);
+        CHECK(sv2::decode_open_mining_channel_error(frames[0].payload).error_code ==
+              "channel-type-change-requires-reconnect");
+        CHECK_FALSE(session.authorized());
+    }
+}
+
+TEST_CASE("SV2 closes on extranonce exhaustion instead of repeating Standard work") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    for (const std::size_t width : {2u, 8u}) {
+        FakePool pool(now);
+        pool.extranonce_size = width;
+        pool.job = std::make_shared<stratum::Job>(
+            "source-job", from_template(gbt_json{{"height", 200}, {"version", 0x20000000},
+                {"curtime", now}, {"bits", "1d00ffff"}, {"coinbasevalue", 5000000000LL},
+                {"previousblockhash", std::string(64, '0')},
+                {"transactions", gbt_json::array_t{}}}), Bytes{}, 4, width, 1);
+        FakeConnection connection;
+        sv2::Session session(pool, connection, util::from_hex("01020304"));
+        setup(session);
+        connection.take_frames();
+        const uint64_t maximum = width == 2 ? 65535 : std::numeric_limits<uint64_t>::max();
+        sv2::SessionTestPeek::seed_extranonce(session, maximum - 1);
+        open_channel(session);
+        const auto initial = connection.take_frames();
+        REQUIRE(initial.size() == 3);
+        const auto opened = sv2::decode_open_standard_mining_channel_success(initial[0].payload);
+        CHECK(std::ranges::all_of(ByteView(opened.extranonce_prefix).subspan(4),
+                                  [](uint8_t byte) { return byte == 0xff; }));
+        CHECK_FALSE(session.should_close());
+        pool.job->set_publication_sequence(1);
+        session.publish_job(*pool.job, false);
+        CHECK(session.should_close());
+        CHECK(connection.take_frames().empty());
+    }
+}
+
+TEST_CASE("SV2 job IDs never wrap back to an already issued handle") {
+    FakePool pool(static_cast<uint32_t>(std::time(nullptr)));
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+    setup(session);
+    connection.take_frames();
+    sv2::SessionTestPeek::seed_job_id(session, std::numeric_limits<uint32_t>::max());
+    open_channel(session);
+    const auto initial = connection.take_frames();
+    REQUIRE(initial.size() == 3);
+    CHECK(sv2::decode_new_mining_job(initial[1].payload).job_id ==
+          std::numeric_limits<uint32_t>::max());
+    pool.job->set_publication_sequence(1);
+    session.publish_job(*pool.job, false);
+    CHECK(session.should_close());
+    CHECK(connection.take_frames().empty());
 }
 
 TEST_CASE("SV2 opens independent Extended Channels with disjoint extranonces") {
@@ -1339,7 +1426,7 @@ TEST_CASE("SV2 Standard rejects nTime ahead of the latest prevhash window") {
           "invalid-ntime");
 }
 
-TEST_CASE("SV2 Extended enforces the latest prevhash nTime window") {
+TEST_CASE("SV2 Extended enforces the announced nTime window") {
     const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
     FakePool pool(now);
     pool.job = make_job(now, "207fffff");
@@ -1360,6 +1447,7 @@ TEST_CASE("SV2 Extended enforces the latest prevhash nTime window") {
     REQUIRE(frames.size() == 1);
     const auto behind =
         sv2::decode_new_extended_mining_job(frames[0].payload);
+    CHECK(behind.minimum_ntime == now);
     session.handle_bytes(sv2::encode_message(sv2::SubmitSharesExtended{
         opened.channel_id, 21, behind.job_id, 21, now - 1,
         pool.job->version(), Bytes(opened.extranonce_size)}));
@@ -1371,16 +1459,187 @@ TEST_CASE("SV2 Extended enforces the latest prevhash nTime window") {
     pool.job = make_job(now + 10, "207fffff");
     session.publish_job(*pool.job, false);
     frames = connection.take_frames();
-    REQUIRE(frames.size() == 1);
+    REQUIRE(frames.size() == 2);
     const auto ahead =
         sv2::decode_new_extended_mining_job(frames[0].payload);
+    CHECK_FALSE(ahead.minimum_ntime.has_value());
+    REQUIRE(frames[1].message_type == sv2::SetNewPrevHash::kMessageType);
+    CHECK(sv2::decode_set_new_prev_hash(frames[1].payload).minimum_ntime == now + 10);
     session.handle_bytes(sv2::encode_message(sv2::SubmitSharesExtended{
-        opened.channel_id, 22, ahead.job_id, 22, now + 10,
+        opened.channel_id, 22, ahead.job_id, 22, now + 60,
         pool.job->version(), Bytes(opened.extranonce_size)}));
     frames = connection.take_frames();
     REQUIRE(frames.size() == 1);
     CHECK(sv2::decode_submit_shares_error(frames[0].payload).error_code ==
           "invalid-ntime");
+}
+
+TEST_CASE("SV2 Standard refreshes an aged channel's timestamp before issuing current work") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now - 30);
+    pool.job = make_job(now - 30, "207fffff");
+    pool.initial_difficulty = 2.5;
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+
+    setup(session);
+    connection.take_frames();
+    open_channel(session);
+    const auto initial = connection.take_frames();
+    REQUIRE(initial.size() == 3);
+    const auto opened =
+        sv2::decode_open_standard_mining_channel_success(initial[0].payload);
+    CHECK(sv2::decode_set_new_prev_hash(initial[2].payload).minimum_ntime == now - 30);
+
+    pool.job = make_job(now, "207fffff");
+    session.publish_job(*pool.job, false);
+    auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 3);
+    REQUIRE(frames[0].message_type == sv2::SetExtranoncePrefix::kMessageType);
+    REQUIRE(frames[1].message_type == sv2::NewMiningJob::kMessageType);
+    REQUIRE(frames[2].message_type == sv2::SetNewPrevHash::kMessageType);
+    const auto prefix = sv2::decode_set_extranonce_prefix(frames[0].payload);
+    const auto announced = sv2::decode_new_mining_job(frames[1].payload);
+    const auto previous_hash = sv2::decode_set_new_prev_hash(frames[2].payload);
+    CHECK_FALSE(announced.minimum_ntime.has_value());
+    CHECK(previous_hash.job_id == announced.job_id);
+    CHECK(previous_hash.minimum_ntime == now);
+
+    const auto work = pool.job->build_standard_work(kPayoutScript, prefix.extranonce_prefix);
+    const auto target = util::uint256::from_le_bytes(opened.target);
+    std::optional<uint32_t> winning_nonce;
+    for (uint32_t nonce = 0; nonce < 1'000; ++nonce) {
+        const auto result = pool.job->validate_standard_share(
+            {work.legacy_coinbase, work.merkle_root, now, nonce,
+             pool.job->version(), pool.version_mask(), target, now});
+        if (result && result->is_block) {
+            winning_nonce = nonce;
+            break;
+        }
+    }
+    REQUIRE(winning_nonce.has_value());
+    session.handle_bytes(sv2::encode_message(sv2::SubmitSharesStandard{
+        opened.channel_id, 1, announced.job_id, *winning_nonce, now, pool.job->version()}));
+    frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    CHECK(frames[0].message_type == sv2::SubmitSharesSuccess::kMessageType);
+    CHECK(pool.blocks == 1);
+    CHECK(pool.block_job == pool.job.get());
+}
+
+TEST_CASE("SV2 Extended refreshes an aged channel's timestamp before issuing current work") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now - 30);
+    pool.job = make_job(now - 30, "207fffff");
+    pool.initial_difficulty = 2.5;
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+
+    setup(session, sv2::kSetupFlagRequiresVersionRolling);
+    connection.take_frames();
+    open_extended_channel(session);
+    const auto initial = connection.take_frames();
+    REQUIRE(initial.size() == 3);
+    const auto opened =
+        sv2::decode_open_extended_mining_channel_success(initial[0].payload);
+    CHECK(sv2::decode_set_new_prev_hash(initial[2].payload).minimum_ntime == now - 30);
+
+    pool.job = make_job(now, "207fffff");
+    session.publish_job(*pool.job, false);
+    auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 2);
+    REQUIRE(frames[0].message_type == sv2::NewExtendedMiningJob::kMessageType);
+    REQUIRE(frames[1].message_type == sv2::SetNewPrevHash::kMessageType);
+    const auto announced = sv2::decode_new_extended_mining_job(frames[0].payload);
+    const auto previous_hash = sv2::decode_set_new_prev_hash(frames[1].payload);
+    CHECK_FALSE(announced.minimum_ntime.has_value());
+    CHECK(previous_hash.job_id == announced.job_id);
+    CHECK(previous_hash.minimum_ntime == now);
+
+    const auto work = pool.job->build_extended_work(kPayoutScript);
+    const Bytes extranonce(opened.extranonce_size);
+    const auto target = util::uint256::from_le_bytes(opened.target);
+    std::optional<uint32_t> winning_nonce;
+    for (uint32_t nonce = 0; nonce < 1'000; ++nonce) {
+        const auto result = pool.job->validate_extended_share(
+            work, {opened.extranonce_prefix, extranonce, opened.extranonce_size,
+                   now, nonce, pool.job->version(), pool.version_mask(), target, now});
+        if (result && result->is_block) {
+            winning_nonce = nonce;
+            break;
+        }
+    }
+    REQUIRE(winning_nonce.has_value());
+    session.handle_bytes(sv2::encode_message(sv2::SubmitSharesExtended{
+        opened.channel_id, 1, announced.job_id, *winning_nonce, now,
+        pool.job->version(), extranonce}));
+    frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    CHECK(frames[0].message_type == sv2::SubmitSharesSuccess::kMessageType);
+    CHECK(pool.blocks == 1);
+    CHECK(pool.block_job == pool.job.get());
+}
+
+TEST_CASE("SV2 retains late same-parent block solutions across clean work updates") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now);
+    pool.job = make_job(now, "207fffff");
+    pool.initial_difficulty = 2.5;
+    const auto original_job = pool.job;
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+
+    setup(session, sv2::kSetupFlagRequiresVersionRolling);
+    connection.take_frames();
+    open_extended_channel(session);
+    const auto initial = connection.take_frames();
+    REQUIRE(initial.size() == 3);
+    const auto opened =
+        sv2::decode_open_extended_mining_channel_success(initial[0].payload);
+    const auto announced = sv2::decode_new_extended_mining_job(initial[1].payload);
+    const auto work = original_job->build_extended_work(kPayoutScript);
+    const Bytes extranonce(opened.extranonce_size);
+    const auto target = util::uint256::from_le_bytes(opened.target);
+    std::optional<uint32_t> winning_nonce;
+    for (uint32_t nonce = 0; nonce < 1'000; ++nonce) {
+        const auto result = original_job->validate_extended_share(
+            work, {opened.extranonce_prefix, extranonce, opened.extranonce_size,
+                   now, nonce, original_job->version(), pool.version_mask(), target, now});
+        if (result && result->is_block) {
+            winning_nonce = nonce;
+            break;
+        }
+    }
+    REQUIRE(winning_nonce.has_value());
+
+    pool.job = make_job(now + 1, "207fffff");
+    session.publish_job(*pool.job, true);
+    auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 2);
+    CHECK(sv2::decode_set_new_prev_hash(frames[1].payload).minimum_ntime == now + 1);
+
+    sv2::SubmitSharesExtended share{
+        opened.channel_id, 1, announced.job_id, *winning_nonce, now,
+        original_job->version(), extranonce};
+    session.handle_bytes(sv2::encode_message(share));
+    frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    CHECK(frames[0].message_type == sv2::SubmitSharesSuccess::kMessageType);
+    CHECK(pool.blocks == 1);
+    CHECK(pool.block_job == original_job.get());
+
+    for (uint32_t offset = 2; offset <= 3; ++offset) {
+        pool.job = make_job(now + offset, "207fffff");
+        session.publish_job(*pool.job, true);
+        REQUIRE(connection.take_frames().size() == 2);
+    }
+    share.sequence_number = 2;
+    session.handle_bytes(sv2::encode_message(share));
+    frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].message_type == sv2::SubmitSharesError::kMessageType);
+    CHECK(sv2::decode_submit_shares_error(frames[0].payload).error_code == "duplicate-share");
+    CHECK(pool.blocks == 1);
 }
 
 TEST_CASE("SV2 Extended replaces prevhash context when same-parent nBits changes") {

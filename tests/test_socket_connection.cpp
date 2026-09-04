@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -92,6 +93,22 @@ TEST_CASE("tune_socket scales TCP_USER_TIMEOUT with a large rebroadcast interval
 #ifdef TCP_USER_TIMEOUT
     // 2 * 300 = 600s > 160s floor -> 600000 ms.
     CHECK(getopt_int(fd, IPPROTO_TCP, TCP_USER_TIMEOUT) == 600 * 1000);
+#endif
+    ::close(fd);
+}
+
+TEST_CASE("keepalive_user_timeout_ms saturates before integer overflow") {
+    constexpr int kMaximum = std::numeric_limits<int>::max();
+    CHECK(keepalive_user_timeout_ms(1000000) == 2000000000);
+    CHECK(keepalive_user_timeout_ms(static_cast<double>(kMaximum) / 2000.0) == kMaximum);
+    CHECK(keepalive_user_timeout_ms(2000000) == kMaximum);
+    CHECK(keepalive_user_timeout_ms(std::numeric_limits<double>::max()) == kMaximum);
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    tune_socket(fd, std::numeric_limits<double>::max());
+#ifdef TCP_USER_TIMEOUT
+    CHECK(getopt_int(fd, IPPROTO_TCP, TCP_USER_TIMEOUT) == kMaximum);
 #endif
     ::close(fd);
 }

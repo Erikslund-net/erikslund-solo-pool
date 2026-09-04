@@ -70,6 +70,32 @@ TEST_CASE("call_one returns the result subtree, not the whole envelope") {
     CHECK_FALSE(result.contains("id")); // the envelope id/error are stripped
 }
 
+TEST_CASE("mining tip validation rejects incomplete or malformed RPC data") {
+    BodyRpc rpc;
+    glz::generic info;
+    info["chain"] = "regtest";
+    info["blocks"] = 170.0;
+    info["bestblockhash"] = std::string(64, 'a');
+    SUBCASE("missing fields") { info = glz::generic::object_t{}; }
+    SUBCASE("unknown chain") { info["chain"] = "unknown"; }
+    SUBCASE("negative height") { info["blocks"] = -1.0; }
+    SUBCASE("fractional height") { info["blocks"] = 170.5; }
+    SUBCASE("out of range height") { info["blocks"] = 2'147'483'648.0; }
+    SUBCASE("short hash") { info["bestblockhash"] = "abc"; }
+    SUBCASE("non-hex hash") { info["bestblockhash"] = std::string(64, 'z'); }
+    SUBCASE("mainnet missing readiness") { info["chain"] = "main"; }
+    SUBCASE("mainnet wrong readiness type") {
+        info["chain"] = "main";
+        info["initialblockdownload"] = "false";
+    }
+    glz::generic envelope;
+    envelope["result"] = info;
+    rpc.body = glz::write_json(envelope).value();
+
+    CHECK_THROWS_AS(rpc.get_mining_tip(), RpcConnectionError);
+    CHECK(rpc.calls == 1);
+}
+
 TEST_CASE("call_one rejects a reply with no result key") {
     BodyRpc rpc;
     rpc.body = R"({"error":null,"id":1})";

@@ -58,6 +58,8 @@ private:
         std::size_t extranonce_size{};
         util::uint256 target;
         uint32_t minimum_ntime{};
+        uint32_t previous_hash_minimum_ntime{};
+        double previous_hash_received_at_steady{};
         bool follows_channel_target = false;
     };
     struct JobBuildPlan {
@@ -217,6 +219,7 @@ private:
     uint64_t extranonce_counter_{};
     uint32_t next_channel_id_ = 1;
     uint32_t next_job_id_ = 1;
+    std::optional<ChannelKind> channel_kind_;
 
     bool setup_complete_ = false;
     uint32_t requested_setup_flags_{};
@@ -243,6 +246,7 @@ private:
     stats::DecayingWindows<stats::kHashrateWindows.size()> hashrate_;
 
     mutable std::mutex mutex_;
+    friend struct SessionTestPeek;
 };
 
 } // namespace erikslund::sv2

@@ -35,9 +35,13 @@
 #include "core/errors.hpp"
 #include "core/logging.hpp"
 #include "gbt_fixture.hpp"
+#include "mining/work_identity.hpp"
 #include "pool/pool.hpp"
+#include "work_generation_fixture.hpp"
 #include "stats/poolstatus.hpp"
+#include "sv2/connection.hpp"
 #include "util/hex.hpp"
+#include "util/endian.hpp"
 #include "util/sha256.hpp"
 
 using namespace erikslund;
@@ -144,9 +148,10 @@ protected:
     }
 };
 
-class TestConnection final : public stratum::Connection {
+class TestConnection final : public stratum::Connection, public sv2::Connection {
 public:
     void send_line(std::string_view) override {}
+    void send_bytes(ByteView) override {}
     std::string peer() const override { return "test"; }
 };
 
@@ -256,6 +261,47 @@ public:
 
 private:
     const bitcoin::BlockTemplate block_template_ = refresh_template();
+};
+
+class TemplateOutageWorkSource final : public bitcoin::WorkSource {
+public:
+    std::atomic<bool> templates_available{true};
+    std::atomic<char> tip{'a'};
+    std::atomic<size_t> tip_probes{0};
+    std::atomic<size_t> template_failures{0};
+    size_t header_fetches = 0;
+
+    bitcoin::ChainInfo detect_chain() override { return {.chain = "regtest", .blocks = 169}; }
+
+    std::string get_tip() override {
+        tip_probes.fetch_add(1, std::memory_order_relaxed);
+        return std::string(64, tip.load());
+    }
+
+    bitcoin::BlockTemplate fetch_template() override {
+        if (!templates_available.load()) {
+            template_failures.fetch_add(1, std::memory_order_relaxed);
+            throw RpcConnectionError("template generation unavailable");
+        }
+        const char current_tip = tip.load();
+        auto result = refresh_template();
+        result.height += current_tip - 'a';
+        result.previousblockhash = std::string(64, current_tip);
+        return result;
+    }
+
+    bitcoin::HeaderFacts fetch_header(const std::string& hash) override {
+        ++header_fetches;
+        const char current_tip = tip.load();
+        return {.height = 169 + current_tip - 'a',
+                .confirmations = hash == std::string(64, current_tip) ? 1 : -1,
+                .bits_hex = "1d00ffff",
+                .mediantime = 1700000000};
+    }
+
+    std::optional<std::string> submit_block_hex(const std::string&) override {
+        return std::nullopt;
+    }
 };
 
 constexpr int64_t kRecoveredBlockHeight = 500;
@@ -410,12 +456,46 @@ public:
             submission_started.release();
             continue_submission.acquire();
         }
-        return "inconclusive";
+        if (attempt == 0 && first_attempt_inconclusive)
+            return "inconclusive";
+        if (fail_submission)
+            throw RpcConnectionError("transport error: connection reset");
+        return response;
     }
 
     std::atomic<size_t> submissions{0};
     std::binary_semaphore submission_started{0};
     std::binary_semaphore continue_submission{0};
+    std::optional<std::string> response = "inconclusive";
+    bool first_attempt_inconclusive = false;
+    bool fail_submission = false;
+};
+
+class BlockingRetryWorkSource final : public bitcoin::WorkSource {
+public:
+    bitcoin::ChainInfo detect_chain() override { return {.chain = "regtest", .blocks = 0}; }
+    std::string get_tip() override { return {}; }
+    bitcoin::BlockTemplate fetch_template() override { return refresh_template(); }
+    bitcoin::HeaderFacts fetch_header(const std::string&) override { return {}; }
+
+    std::optional<std::string> submit_block_hex(const std::string&) override {
+        const size_t attempt = submissions.fetch_add(1, std::memory_order_relaxed);
+        if (attempt == 0)
+            return "inconclusive";
+        if (attempt == 1) {
+            retry_started.release();
+            continue_retry.acquire();
+            return retry_response;
+        }
+        fresh_submission_started.release();
+        return std::nullopt;
+    }
+
+    std::atomic<size_t> submissions{0};
+    std::binary_semaphore retry_started{0};
+    std::binary_semaphore continue_retry{0};
+    std::binary_semaphore fresh_submission_started{0};
+    std::optional<std::string> retry_response = std::nullopt;
 };
 
 template <typename Predicate>
@@ -441,7 +521,7 @@ TEST_CASE("validate_address resolves locally, without any bitcoind RPC") {
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc); // refused -> any RPC call throws
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     // network_ defaults to Regtest. A valid regtest address yields a P2WPKH script with no RPC --
     // the dead endpoint above would make any RPC-based validation fail.
@@ -459,7 +539,7 @@ TEST_CASE("Pool applies reloadable mining settings without replacing startup sta
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     CHECK(pool.snapshot().config_generation == 0);
     CHECK_FALSE(pool.snapshot().last_reload_rejected);
 
@@ -493,7 +573,7 @@ TEST_CASE("SV2 readiness expires without waiting for another handshake") {
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     pool.set_sv2_authenticated_state(true, 1);
     const api::PoolSnapshot expired = pool.snapshot();
@@ -512,7 +592,7 @@ TEST_CASE("next_job_id is 16 hex: a stable per-process prefix + a monotonic coun
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     const std::string a = pool.next_job_id();
     const std::string b = pool.next_job_id();
@@ -537,11 +617,10 @@ TEST_CASE("next_job_id: independent pools advance independent counters") {
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool p1(config, rpc_source);
-    Pool p2(config, rpc_source);
+    Pool p1(config, rpc_source, test::kWorkGeneration);
+    Pool p2(config, rpc_source, test::kWorkGeneration);
 
-    // Each pool's counter starts at 1; the random 32-bit prefix makes the full ids
-    // globally unique across processes (collision probability ~2^-32, not asserted here).
+    // Wire IDs retain independent counters; the coinbase generation separates actual work.
     const std::string id1 = p1.next_job_id();
     const std::string id2 = p2.next_job_id();
     CHECK(id1.size() == 16);
@@ -559,8 +638,8 @@ TEST_CASE("replica extranonce1 prefixes partition otherwise identical session co
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
     const auto before_start = static_cast<uint32_t>(std::time(nullptr));
-    Pool first(first_config, rpc_source);
-    Pool second(second_config, rpc_source);
+    Pool first(first_config, rpc_source, test::kWorkGeneration);
+    Pool second(second_config, rpc_source, test::kWorkGeneration);
 
     const auto first_session = first.add_client(std::make_shared<TestConnection>());
     const auto second_session = second.add_client(std::make_shared<TestConnection>());
@@ -583,6 +662,42 @@ TEST_CASE("replica extranonce1 prefixes partition otherwise identical session co
     CHECK(next_first_counter == first_counter + 1);
 }
 
+TEST_CASE("fastblock follows successive tips during a template outage and recovers") {
+    Config config;
+    config.poll_interval = 0.001;
+    config.work_rebroadcast_seconds = 3600;
+    TemplateOutageWorkSource source;
+    Pool pool(config, source, test::kWorkGeneration);
+    std::jthread worker([&pool](const std::stop_token& stop) { pool.refresh_work(stop); });
+    REQUIRE(wait_until([&] { return source.tip_probes.load() != 0; }));
+    REQUIRE(pool.current_job()->mines_on(std::string(64, 'a')));
+
+    source.templates_available.store(false);
+    source.tip.store('b');
+    REQUIRE(wait_until([&] { return source.template_failures.load() != 0; }));
+    pool.on_zmq_block(std::string(64, 'b'));
+    CHECK(pool.current_job()->mines_on(std::string(64, 'b')));
+
+    source.tip.store('c');
+    pool.on_zmq_block(std::string(64, 'c'));
+    const auto latest_fastblock = pool.current_job();
+    CHECK(latest_fastblock->mines_on(std::string(64, 'c')));
+    CHECK(latest_fastblock->height() == 172);
+    CHECK(source.header_fetches == 2);
+
+    pool.on_zmq_block(std::string(64, 'c'));
+    CHECK(pool.current_job() == latest_fastblock);
+    CHECK(source.header_fetches == 2);
+
+    source.templates_available.store(true);
+    REQUIRE(wait_until([&] { return pool.current_job() != latest_fastblock; }));
+    CHECK(pool.current_job()->mines_on(std::string(64, 'c')));
+    const auto recovered = pool.current_job();
+    pool.on_zmq_block(std::string(64, 'c'));
+    CHECK(pool.current_job() == recovered);
+    CHECK(source.header_fetches == 2);
+}
+
 TEST_CASE("refresh_work logs one warning and one recovery per outage") {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "ep-refresh-log-test";
@@ -597,7 +712,7 @@ TEST_CASE("refresh_work logs one warning and one recovery per outage") {
     config.poll_interval = 0.001;
     config.work_rebroadcast_seconds = 3600;
     FlappingWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     std::jthread worker([&pool](const std::stop_token& stop) { pool.refresh_work(stop); });
 
     const bool template_ready = wait_until([&pool] { return pool.current_job() != nullptr; });
@@ -653,7 +768,7 @@ TEST_CASE("resubmit_spooled_blocks leaves the block on disk when bitcoind is unr
     UnreachableRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
     {
-        Pool pool(config, rpc_source);
+        Pool pool(config, rpc_source, test::kWorkGeneration);
         pool.resubmit_spooled_blocks();
         REQUIRE(wait_until([&] { return rpc.calls.load(std::memory_order_relaxed) == 1; }));
     }
@@ -679,7 +794,7 @@ TEST_CASE("resubmit_spooled_blocks leaves an inconclusive submission available f
     InconclusiveRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
     {
-        Pool pool(config, rpc_source);
+        Pool pool(config, rpc_source, test::kWorkGeneration);
         pool.resubmit_spooled_blocks();
         REQUIRE(wait_until([&] { return rpc.calls.load(std::memory_order_relaxed) == 1; }));
     }
@@ -700,7 +815,7 @@ TEST_CASE("resubmit_spooled_blocks is a no-op when there is no blocks directory"
     config.stats_directory = stats.string();
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     CHECK_NOTHROW(pool.resubmit_spooled_blocks()); // nothing spooled -> nothing to do
 }
 
@@ -724,6 +839,15 @@ const char* kAddr = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
 
 namespace erikslund {
 struct PoolTestPeek {
+    static auto make_job(Pool& pool, bitcoin::BlockTemplate block_template) {
+        return pool.make_job(std::move(block_template), false);
+    }
+    static void seed_extranonce_counter(Pool& pool, uint64_t value) {
+        pool.extranonce1_counter_.store(value);
+    }
+    static void exhaust_job_counter(Pool& pool) {
+        pool.job_counter_.store(std::numeric_limits<uint64_t>::max());
+    }
     static void prune(Pool& pool, int64_t now) { pool.prune_user_stats(now); }
     static bool submit(Pool& pool, const std::string& hash, const std::string& address) {
         const Pool::PendingBlock block{1, hash, "00", address, "w"};
@@ -765,16 +889,17 @@ struct PoolTestPeek {
         const std::scoped_lock lock(pool.submit_mutex_);
         return pool.submit_queue_.size();
     }
-    static void retry_live_submissions_now(Pool& pool) {
-        {
-            const std::scoped_lock lock(pool.submit_mutex_);
-            for (auto& submission : pool.submit_queue_)
-                submission.retry_after = {};
-        }
-        pool.submit_cv_.notify_all();
-    }
     static std::stop_token live_submission_stop_token(Pool& pool) {
         return pool.submit_thread_.get_stop_token();
+    }
+    static std::stop_token recovery_submission_stop_token(Pool& pool) {
+        return pool.recovery_thread_.get_stop_token();
+    }
+    static void stop_workers(Pool& pool) { pool.stop_workers(); }
+    static void stop_recovery_worker(Pool& pool) {
+        pool.recovery_thread_.request_stop();
+        pool.recovery_cv_.notify_all();
+        pool.recovery_thread_.join();
     }
     static size_t pending_recovered_submissions(Pool& pool) {
         const std::scoped_lock lock(pool.recovery_mutex_);
@@ -787,6 +912,11 @@ struct PoolTestPeek {
                 submission.retry_after = {};
         }
         pool.recovery_cv_.notify_all();
+    }
+    static void delay_recovered_submissions(Pool& pool) {
+        const std::scoped_lock lock(pool.recovery_mutex_);
+        for (auto& submission : pool.recovery_queue_)
+            submission.retry_after = std::chrono::steady_clock::now() + std::chrono::hours(1);
     }
     static bool submit_recovered(Pool& pool, const std::filesystem::path& path) {
         const Pool::PendingBlock block{0, path.filename().string(), "00112233", "", ""};
@@ -828,7 +958,7 @@ TEST_CASE("a blocked recovered submission does not delay a live block") {
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         pool.resubmit_spooled_blocks();
         const bool recovery_paused =
             source.recovery_paused.try_acquire_for(kSynchronizationTimeout);
@@ -857,7 +987,7 @@ TEST_CASE("a blocked recovered tip lookup does not delay a live block") {
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         pool.resubmit_spooled_blocks();
         REQUIRE(wait_until([&] {
             return source.recovered_submissions.load(std::memory_order_relaxed) == 1;
@@ -896,21 +1026,244 @@ TEST_CASE("an inconclusive live block submission is retried") {
     bitcoin::RpcWorkSource source(rpc);
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         enqueue_live_block(pool, 'c');
         REQUIRE(wait_until([&] { return rpc.calls.load(std::memory_order_relaxed) == 1; }));
-        REQUIRE(wait_until([&] { return PoolTestPeek::pending_live_submissions(pool) == 1; }));
-        CHECK(PoolTestPeek::pending_recovered_submissions(pool) == 0);
+        REQUIRE(wait_until([&] { return PoolTestPeek::pending_recovered_submissions(pool) == 1; }));
+        CHECK(PoolTestPeek::pending_live_submissions(pool) == 0);
 
-        PoolTestPeek::retry_live_submissions_now(pool);
+        PoolTestPeek::retry_recovered_submissions_now(pool);
         REQUIRE(wait_until([&] { return rpc.calls.load(std::memory_order_relaxed) == 2; }));
         REQUIRE(wait_until([&] { return pool.blocks_found() == 1; }));
         CHECK(PoolTestPeek::pending_live_submissions(pool) == 0);
+        CHECK(PoolTestPeek::pending_recovered_submissions(pool) == 0);
 
         CHECK(fs::exists(live_spool_path(stats, 'c')));
     }
 
     fs::remove_all(stats);
+}
+
+TEST_CASE("a blocked live retry does not delay a new candidate or lose block credit") {
+    namespace fs = std::filesystem;
+    const fs::path stats = fs::temp_directory_path() / "ep_live_retry_isolation_test";
+    fs::remove_all(stats);
+    Config config;
+    config.stats_directory = stats.string();
+    BlockingRetryWorkSource source;
+
+    {
+        Pool pool(config, source, test::kWorkGeneration);
+        enqueue_live_block(pool, 'a');
+        if (wait_until([&] { return PoolTestPeek::pending_recovered_submissions(pool) == 1; }))
+            PoolTestPeek::retry_recovered_submissions_now(pool);
+        const bool retry_started = source.retry_started.try_acquire_for(kSynchronizationTimeout);
+        bool fresh_started = false;
+        if (retry_started) {
+            enqueue_live_block(pool, 'b');
+            fresh_started =
+                source.fresh_submission_started.try_acquire_for(kSynchronizationTimeout);
+        }
+        source.continue_retry.release();
+
+        REQUIRE(retry_started);
+        CHECK(fresh_started);
+        REQUIRE(wait_until([&] { return pool.blocks_found() == 2; }));
+        CHECK(source.submissions.load(std::memory_order_relaxed) == 3);
+        CHECK(pool.snapshot().blocks_by_address.at(kAddr) == 2);
+        CHECK(fs::exists(live_spool_path(stats, 'a')));
+        CHECK(fs::exists(live_spool_path(stats, 'b')));
+    }
+    fs::remove_all(stats);
+}
+
+TEST_CASE("shutdown drains queued live candidates before persisting block credit") {
+    namespace fs = std::filesystem;
+    const fs::path stats = fs::temp_directory_path() / "ep_final_block_stats_test";
+    fs::remove_all(stats);
+    Config config;
+    config.stats_directory = stats.string();
+    BlockingLiveWorkSource source;
+    source.response = std::nullopt;
+    SUBCASE("accepted blocks") {}
+    SUBCASE("already known blocks") { source.response = "duplicate"; }
+    SUBCASE("an in-flight failure is retried successfully") {
+        source.first_attempt_inconclusive = true;
+    }
+    SUBCASE("an in-flight failure is already known on retry") {
+        source.first_attempt_inconclusive = true;
+        source.response = "duplicate";
+    }
+
+    {
+        Pool pool(config, source, test::kWorkGeneration);
+        enqueue_live_block(pool, 'f');
+        const bool submission_started =
+            source.submission_started.try_acquire_for(kSynchronizationTimeout);
+        if (!submission_started)
+            source.continue_submission.release();
+        REQUIRE(submission_started);
+        enqueue_live_block(pool, 'a');
+        enqueue_live_block(pool, 'b');
+        enqueue_live_block(pool, 'a');
+        CHECK(PoolTestPeek::pending_live_submissions(pool) == 3);
+
+        std::jthread status_thread([&pool](const std::stop_token& stop) { pool.status_loop(stop); });
+        status_thread.request_stop();
+        status_thread.join();
+        CHECK(pool.blocks_found() == 0);
+
+        std::binary_semaphore stop_requested{0};
+        std::stop_callback stop_callback(PoolTestPeek::live_submission_stop_token(pool),
+                                        [&stop_requested] { stop_requested.release(); });
+        auto shutdown = std::async(std::launch::async, [&pool] { pool.shutdown(); });
+        const bool stop_observed = stop_requested.try_acquire_for(kSynchronizationTimeout);
+        const auto blocked_state = shutdown.wait_for(std::chrono::seconds::zero());
+        source.continue_submission.release();
+
+        REQUIRE(stop_observed);
+        CHECK(blocked_state == std::future_status::timeout);
+        REQUIRE(shutdown.wait_for(kSynchronizationTimeout) == std::future_status::ready);
+        CHECK_NOTHROW(shutdown.get());
+        const auto recovered = stats::read_pool_status(config.stats_directory);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->blocks_found == 3);
+        CHECK(recovered->blocks_by_address.at(kAddr) == 3);
+        CHECK(PoolTestPeek::pending_live_submissions(pool) == 0);
+        CHECK(PoolTestPeek::pending_recovered_submissions(pool) == 0);
+        const size_t expected_submissions = source.first_attempt_inconclusive ? 5 : 4;
+        CHECK(source.submissions.load(std::memory_order_relaxed) == expected_submissions);
+
+        pool.shutdown();
+        CHECK(source.submissions.load(std::memory_order_relaxed) == expected_submissions);
+        CHECK(pool.blocks_found() == 3);
+    }
+    fs::remove_all(stats);
+}
+
+TEST_CASE("shutdown gives deferred live blocks one final attempt without waiting") {
+    namespace fs = std::filesystem;
+    const fs::path stats = fs::temp_directory_path() / "ep_final_live_retry_test";
+    fs::remove_all(stats);
+    Config config;
+    config.stats_directory = stats.string();
+    BlockingLiveWorkSource source;
+    source.first_attempt_inconclusive = true;
+    source.continue_submission.release();
+    int64_t expected_blocks = 0;
+    SUBCASE("accepted") {
+        source.response = std::nullopt;
+        expected_blocks = 1;
+    }
+    SUBCASE("already known") {
+        source.response = "duplicate";
+        expected_blocks = 1;
+    }
+    SUBCASE("inconclusive") {}
+    SUBCASE("transport error") { source.fail_submission = true; }
+
+    {
+        Pool pool(config, source, test::kWorkGeneration);
+        PoolTestPeek::stop_recovery_worker(pool);
+        enqueue_live_block(pool, 'c');
+        REQUIRE(wait_until([&] { return PoolTestPeek::pending_recovered_submissions(pool) == 1; }));
+        PoolTestPeek::stop_workers(pool);
+        PoolTestPeek::delay_recovered_submissions(pool);
+        REQUIRE(source.submissions.load(std::memory_order_relaxed) == 1);
+
+        const auto started = std::chrono::steady_clock::now();
+        pool.shutdown();
+        CHECK(std::chrono::steady_clock::now() - started < kSynchronizationTimeout);
+        CHECK(source.submissions.load(std::memory_order_relaxed) == 2);
+        CHECK(PoolTestPeek::pending_recovered_submissions(pool) == 0);
+        CHECK(fs::exists(live_spool_path(stats, 'c')));
+        const auto recovered = stats::read_pool_status(config.stats_directory);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->blocks_found == expected_blocks);
+        if (expected_blocks > 0)
+            CHECK(recovered->blocks_by_address.at(kAddr) == expected_blocks);
+        else
+            CHECK(recovered->blocks_by_address.empty());
+
+        pool.shutdown();
+        CHECK(source.submissions.load(std::memory_order_relaxed) == 2);
+        CHECK(pool.blocks_found() == expected_blocks);
+    }
+    fs::remove_all(stats);
+}
+
+TEST_CASE("shutdown retries an in-flight live recovery failure before persisting block credit") {
+    namespace fs = std::filesystem;
+    const fs::path stats = fs::temp_directory_path() / "ep_final_inflight_retry_test";
+    fs::remove_all(stats);
+    Config config;
+    config.stats_directory = stats.string();
+    BlockingRetryWorkSource source;
+    source.retry_response = "inconclusive";
+
+    {
+        Pool pool(config, source, test::kWorkGeneration);
+        enqueue_live_block(pool, 'd');
+        if (wait_until([&] { return PoolTestPeek::pending_recovered_submissions(pool) == 1; }))
+            PoolTestPeek::retry_recovered_submissions_now(pool);
+        const bool retry_started = source.retry_started.try_acquire_for(kSynchronizationTimeout);
+        if (!retry_started)
+            source.continue_retry.release();
+        REQUIRE(retry_started);
+
+        std::binary_semaphore stop_requested{0};
+        std::stop_callback stop_callback(PoolTestPeek::recovery_submission_stop_token(pool),
+                                        [&stop_requested] { stop_requested.release(); });
+        auto shutdown = std::async(std::launch::async, [&pool] { pool.shutdown(); });
+        const bool stop_observed = stop_requested.try_acquire_for(kSynchronizationTimeout);
+        const auto blocked_state = shutdown.wait_for(std::chrono::seconds::zero());
+        source.continue_retry.release();
+
+        REQUIRE(stop_observed);
+        CHECK(blocked_state == std::future_status::timeout);
+        REQUIRE(shutdown.wait_for(kSynchronizationTimeout) == std::future_status::ready);
+        CHECK_NOTHROW(shutdown.get());
+        CHECK(source.submissions.load(std::memory_order_relaxed) == 3);
+        CHECK(PoolTestPeek::pending_recovered_submissions(pool) == 0);
+        const auto recovered = stats::read_pool_status(config.stats_directory);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->blocks_found == 1);
+        CHECK(recovered->blocks_by_address.at(kAddr) == 1);
+        CHECK(fs::exists(live_spool_path(stats, 'd')));
+    }
+    fs::remove_all(stats);
+}
+
+TEST_CASE("shutdown leaves historical recovered blocks for the next startup") {
+    namespace fs = std::filesystem;
+    const auto fixture = write_recovered_block("ep_recovered_shutdown_test");
+    RecoveredBlockWorkSource source({
+        .candidate_hash = fixture.block_hash,
+        .tip_hash = fixture.block_hash,
+    });
+    Config config;
+    config.stats_directory = fixture.stats_directory.string();
+
+    {
+        Pool pool(config, source, test::kWorkGeneration);
+        PoolTestPeek::stop_workers(pool);
+        pool.resubmit_spooled_blocks();
+        REQUIRE(PoolTestPeek::pending_recovered_submissions(pool) == 1);
+
+        pool.shutdown();
+        pool.shutdown();
+        CHECK(source.submissions.load(std::memory_order_relaxed) == 0);
+        CHECK(source.tip_lookups.load(std::memory_order_relaxed) == 0);
+        CHECK(fs::exists(fixture.spool_path));
+        CHECK_FALSE(fs::exists(fixture.spool_path.string() + ".submitted"));
+        CHECK_FALSE(fs::exists(fixture.spool_path.string() + ".stale"));
+        CHECK(pool.blocks_found() == 0);
+        const auto recovered = stats::read_pool_status(config.stats_directory);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->blocks_found == 0);
+        CHECK(recovered->blocks_by_address.empty());
+    }
+    fs::remove_all(fixture.stats_directory);
 }
 
 TEST_CASE("Pool destruction joins an in-flight live submission without retrying") {
@@ -920,7 +1273,7 @@ TEST_CASE("Pool destruction joins an in-flight live submission without retrying"
     Config config;
     config.stats_directory = stats.string();
     BlockingLiveWorkSource source;
-    auto pool = std::make_unique<Pool>(config, source);
+    auto pool = std::make_unique<Pool>(config, source, test::kWorkGeneration);
     const std::stop_token submit_stop = PoolTestPeek::live_submission_stop_token(*pool);
 
     enqueue_live_block(*pool, 'f');
@@ -961,7 +1314,7 @@ TEST_CASE("recovered blocks are submitted once before consulting the chain tip")
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         REQUIRE(wait_for_first_recovered_submission(pool, source));
         CHECK(source.tip_lookups.load(std::memory_order_relaxed) == 0);
         CHECK(fs::exists(fixture.spool_path));
@@ -981,7 +1334,7 @@ TEST_CASE("a recovered block at the active tip is archived before a second submi
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         REQUIRE(wait_for_first_recovered_submission(pool, source));
         PoolTestPeek::retry_recovered_submissions_now(pool);
         REQUIRE(wait_until(
@@ -1006,7 +1359,7 @@ TEST_CASE("a recovered block on the active chain is archived as submitted after 
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         REQUIRE(wait_for_first_recovered_submission(pool, source));
         PoolTestPeek::retry_recovered_submissions_now(pool);
         REQUIRE(wait_until(
@@ -1032,7 +1385,7 @@ TEST_CASE("a recovered side-chain block is archived as stale after the tip advan
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         REQUIRE(wait_for_first_recovered_submission(pool, source));
         PoolTestPeek::retry_recovered_submissions_now(pool);
         REQUIRE(wait_until(
@@ -1056,7 +1409,7 @@ TEST_CASE("a recovered block retries when a different block is the tip at the sa
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         REQUIRE(wait_for_first_recovered_submission(pool, source));
         PoolTestPeek::retry_recovered_submissions_now(pool);
         REQUIRE(wait_until(
@@ -1080,7 +1433,7 @@ TEST_CASE("a recovered block retries when the chain tip lookup fails") {
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         REQUIRE(wait_for_first_recovered_submission(pool, source));
         PoolTestPeek::retry_recovered_submissions_now(pool);
         REQUIRE(wait_until(
@@ -1105,7 +1458,7 @@ TEST_CASE("a recovered block retries when its filename hash does not match its h
     config.stats_directory = fixture.stats_directory.string();
 
     {
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         REQUIRE(wait_for_first_recovered_submission(pool, source));
         PoolTestPeek::retry_recovered_submissions_now(pool);
         REQUIRE(wait_until(
@@ -1132,7 +1485,7 @@ TEST_CASE("an archive failure leaves a terminal recovered block for the next res
     DuplicateRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
     {
-        Pool pool(config, rpc_source);
+        Pool pool(config, rpc_source, test::kWorkGeneration);
         CHECK_FALSE(PoolTestPeek::submit_recovered(pool, block));
         CHECK(rpc.calls.load(std::memory_order_relaxed) == 1);
         CHECK(pool.blocks_found() == 0);
@@ -1155,7 +1508,7 @@ TEST_CASE("a recovered block retries in-process without duplicate enqueue or acc
     RecoveringRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
     {
-        Pool pool(config, rpc_source);
+        Pool pool(config, rpc_source, test::kWorkGeneration);
         pool.resubmit_spooled_blocks();
         REQUIRE(wait_until([&] { return rpc.calls.load(std::memory_order_relaxed) == 1; }));
         REQUIRE(
@@ -1187,7 +1540,7 @@ TEST_CASE("a recovered duplicate archives as submitted without accounting credit
     DuplicateRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
     {
-        Pool pool(config, rpc_source);
+        Pool pool(config, rpc_source, test::kWorkGeneration);
         pool.resubmit_spooled_blocks();
         REQUIRE(wait_until([&] { return fs::exists(block.string() + ".submitted"); }));
         CHECK(pool.blocks_found() == 0);
@@ -1210,7 +1563,7 @@ TEST_CASE("a recovered rejection archives as rejected") {
     RejectingRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
     {
-        Pool pool(config, rpc_source);
+        Pool pool(config, rpc_source, test::kWorkGeneration);
         pool.resubmit_spooled_blocks();
         REQUIRE(wait_until([&] { return fs::exists(block.string() + ".rejected"); }));
         CHECK(pool.blocks_found() == 0);
@@ -1220,7 +1573,7 @@ TEST_CASE("a recovered rejection archives as rejected") {
     fs::remove_all(stats);
 }
 
-TEST_CASE("block submission starts before durable spooling completes") {
+TEST_CASE("block submission starts before a failed spool completes and logs recovery hex") {
     namespace fs = std::filesystem;
     const fs::path stats = fs::temp_directory_path() /
                            std::format("ep_block_dispatch_{}", static_cast<long>(::getpid()));
@@ -1232,11 +1585,13 @@ TEST_CASE("block submission starts before durable spooling completes") {
     fs::remove_all(stats);
     fs::create_directories(blocks);
     REQUIRE(::mkfifo(temporary_path.c_str(), 0600) == 0);
+    const fs::path log_path = stats / "spool.log";
+    REQUIRE(log::set_log_file(log_path.string()));
 
     Config config;
     config.stats_directory = stats.string();
     FlappingWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     const Bytes tag{'/', 't', '/'};
     stratum::Job job("job", refresh_template(), tag, 4, 4, 1);
     stratum::ShareResult result;
@@ -1254,24 +1609,131 @@ TEST_CASE("block submission starts before durable spooling completes") {
     CHECK(wait_until([&] { return source.submissions.load(std::memory_order_acquire) == 1; }));
     CHECK_FALSE(callback_finished.load(std::memory_order_acquire));
 
-    // Opening both ends releases the writer while keeping the FIFO readable through fsync.
+    // A FIFO blocks the writer until opened, then makes fsync fail with EINVAL.
     const int fifo = ::open(temporary_path.c_str(), O_RDWR | O_NONBLOCK);
     REQUIRE(fifo >= 0);
     callback.join();
     ::close(fifo);
+    log::set_log_file("");
 
     CHECK(callback_finished.load(std::memory_order_acquire));
+    CHECK_FALSE(fs::exists(final_path));
+    CHECK(fs::exists(temporary_path));
+    std::ifstream log_input(log_path);
+    std::stringstream log_contents;
+    log_contents << log_input.rdbuf();
+    const std::string contents = log_contents.str();
+    CHECK(contents.contains("Could not spool block"));
+    CHECK(contents.contains("fsync"));
+    CHECK(contents.contains("HEX FOLLOWS: " +
+                            job.build_block_hex(result.legacy_coinbase, result.header)));
+    CHECK_FALSE(contents.contains("Spooled block to"));
     fs::remove_all(stats);
+}
+
+TEST_CASE("coinbase work identity separates jobs and restarts despite overlapping timestamps") {
+    const Config config;
+    bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
+    bitcoin::RpcWorkSource source(rpc);
+    Pool first(config, source, test::kWorkGeneration);
+    Pool restarted(config, source, test::kWorkGeneration + 1);
+    const auto first_job = PoolTestPeek::make_job(first, refresh_template());
+    const auto same_template = PoolTestPeek::make_job(first, refresh_template());
+    auto later_template = refresh_template();
+    ++later_template.curtime;
+    const auto later_job = PoolTestPeek::make_job(first, later_template);
+    const auto restarted_job = PoolTestPeek::make_job(restarted, refresh_template());
+    const Bytes payout_script = *first.validate_address(kAddr);
+    const Bytes extranonce(config.extranonce1_size + config.extranonce2_size, 0);
+
+    const auto first_work = first_job->build_standard_work(payout_script, extranonce);
+    for (const auto& job : {same_template, later_job, restarted_job}) {
+        const auto work = job->build_standard_work(payout_script, extranonce);
+        CHECK(work.legacy_coinbase != first_work.legacy_coinbase);
+        CHECK(work.merkle_root != first_work.merkle_root);
+        auto extended = job->build_extended_work(payout_script);
+        append(extended.coinbase_tx_prefix, extranonce);
+        append(extended.coinbase_tx_prefix, extended.coinbase_tx_suffix);
+        CHECK(extended.coinbase_tx_prefix == work.legacy_coinbase);
+    }
+    const Bytes coinbase_suffix = first_job->build_coinbase2(payout_script);
+    const auto identifier = ByteView(coinbase_suffix).subspan(
+        config.coinbase_signature.size(), mining::kWorkIdentifierSize);
+    CHECK(util::read_le64(identifier.data()) == test::kWorkGeneration);
+    CHECK(util::read_le64(identifier.data() + sizeof(uint64_t)) == 1);
+
+    stratum::StandardShareInput input;
+    input.legacy_coinbase = first_work.legacy_coinbase;
+    input.merkle_root = first_work.merkle_root;
+    input.ntime = later_template.curtime;
+    input.version = first_job->version();
+    input.now_unix = later_template.curtime;
+    input.share_target = util::uint256::from_le_bytes(Bytes(32, 0xff));
+    const auto rolled_share = first_job->validate_standard_share(input);
+    REQUIRE(rolled_share);
+    const auto later_work = later_job->build_standard_work(payout_script, extranonce);
+    input.legacy_coinbase = later_work.legacy_coinbase;
+    input.merkle_root = later_work.merkle_root;
+    const auto later_share = later_job->validate_standard_share(input);
+    REQUIRE(later_share);
+    CHECK(rolled_share->header != later_share->header);
+
+    CHECK(first_job->work_signature() == same_template->work_signature());
+    CHECK(first_job->work_signature() == restarted_job->work_signature());
+    PoolTestPeek::publish(first, first_job);
+    PoolTestPeek::publish(first, same_template);
+    CHECK(first.current_job() == first_job);
+    PoolTestPeek::publish(first, later_job);
+    CHECK(first.current_job() == later_job);
+}
+
+TEST_CASE("pool coinbase extras are pushed data even when they contain sigop bytes") {
+    bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
+    bitcoin::RpcWorkSource source(rpc);
+    for (const std::size_t signature_size : {47u, 48u, 60u}) {
+        Config config;
+        config.coinbase_signature = std::string(signature_size, static_cast<char>(0xae));
+        Pool pool(config, source, 0xaeaeaeaeaeaeaeaeULL);
+        const auto job = PoolTestPeek::make_job(pool, refresh_template());
+        const auto prefix = util::from_hex(job->coinbase1_hex());
+        const std::size_t data_size = config.extranonce1_size + config.extranonce2_size +
+                                      signature_size + mining::kWorkIdentifierSize;
+        CHECK(prefix.back() == data_size);
+        if (data_size > 75)
+            CHECK(prefix[prefix.size() - 2] == 0x4c);
+        const auto work = job->build_standard_work(
+            *pool.validate_address(kAddr), Bytes(config.extranonce1_size + config.extranonce2_size, 0xae));
+        // The entire pushed payload ends exactly where nSequence begins.
+        CHECK(work.legacy_coinbase[prefix.size() + data_size] == 0xff);
+        CHECK(work.legacy_coinbase[41] <= 100);
+    }
+}
+
+TEST_CASE("pool refuses reused session and job counters without dropping existing miners") {
+    const Config config;
+    bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
+    bitcoin::RpcWorkSource source(rpc);
+    Pool pool(config, source, test::kWorkGeneration);
+    PoolTestPeek::seed_extranonce_counter(pool, std::numeric_limits<uint32_t>::max() - 1);
+    const auto session = pool.add_client(std::make_shared<TestConnection>());
+    CHECK(session->extranonce1_hex() == "ffffffff");
+    CHECK_THROWS_AS(pool.add_client(std::make_shared<TestConnection>()), std::overflow_error);
+    CHECK_THROWS_AS(pool.add_sv2_client(std::make_shared<TestConnection>()), std::overflow_error);
+    CHECK(pool.client_count() == 1);
+    PoolTestPeek::exhaust_job_counter(pool);
+    CHECK_THROWS_AS(pool.next_job_id(), std::overflow_error);
+    CHECK_THROWS_AS(PoolTestPeek::make_job(pool, refresh_template()), std::overflow_error);
+    CHECK_THROWS_AS(Pool(Config{}, source, 0), std::invalid_argument);
 }
 
 TEST_CASE("SV2 publication worker is opt-in") {
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
 
-    Pool sv1_pool(Config{}, rpc_source);
+    Pool sv1_pool(Config{}, rpc_source, test::kWorkGeneration);
     CHECK_FALSE(PoolTestPeek::publication_worker_started(sv1_pool));
 
-    Pool sv2_pool(sv2_publication_config(), rpc_source);
+    Pool sv2_pool(sv2_publication_config(), rpc_source, test::kWorkGeneration);
     CHECK(PoolTestPeek::publication_worker_started(sv2_pool));
 }
 
@@ -1279,7 +1741,7 @@ TEST_CASE("SV2 publication cannot delay SV1 work delivery") {
     Config config = sv2_publication_config();
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     auto delayed = std::make_shared<BlockingPublicationClient>();
     auto immediate = std::make_shared<RecordingPublicationClient>();
@@ -1307,7 +1769,7 @@ TEST_CASE("deferred SV2 publication coalesces to the newest clean work") {
     Config config = sv2_publication_config();
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     auto delayed = std::make_shared<BlockingPublicationClient>();
     PoolTestPeek::add_client(pool, delayed, true);
@@ -1335,7 +1797,7 @@ TEST_CASE("deferred SV2 publication preserves clean from late older work") {
     Config config = sv2_publication_config();
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     auto delayed = std::make_shared<BlockingPublicationClient>();
     PoolTestPeek::add_client(pool, delayed, true);
@@ -1361,7 +1823,7 @@ TEST_CASE("disconnect removes queued SV2 publication") {
     Config config = sv2_publication_config();
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     auto delayed = std::make_shared<BlockingPublicationClient>();
     auto disconnected = std::make_shared<RecordingPublicationClient>();
@@ -1388,7 +1850,7 @@ TEST_CASE("a block whose accepting reply was lost is still credited exactly once
     Config config;
     DuplicateRpc rpc; // every submit answers "duplicate"
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     const std::string hash(64, 'b');
 
     CHECK_FALSE(PoolTestPeek::submit(pool, hash, kAddr)); // terminal, no retry
@@ -1412,7 +1874,7 @@ TEST_CASE("a lost reply followed by duplicate credits the block on the retry") {
     Config config;
     LostReplyThenDuplicateRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     const std::string hash(64, 'd');
 
     CHECK(PoolTestPeek::submit(pool, hash, kAddr)); // transport died -> retry requested
@@ -1429,7 +1891,7 @@ TEST_CASE("duplicate-inconclusive is retryable and is never credited") {
     Config config;
     DuplicateInconclusiveRpc rpc;
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     CHECK(PoolTestPeek::submit(pool, std::string(64, 'e'), kAddr)); // retry requested
     CHECK(pool.blocks_found() == 0);                                // NOT credited
@@ -1444,7 +1906,7 @@ TEST_CASE("prune keeps a held worker row and evicts it once the last handle is g
     config.stats_directory = stats.string();
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     auto accounting = pool.attach_worker(kAddr, "w1"); // an authorized Session holds this handle
     REQUIRE(accounting);
@@ -1468,7 +1930,7 @@ TEST_CASE("share hooks accumulate persistent per-worker stats; sessions with one
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     // Two connections share worker name "w1"; a third is "w2". They must MERGE by name.
     pool.note_accepted_share(kAddr, "w1", 5.0, 5.0);
@@ -1494,7 +1956,7 @@ TEST_CASE("cached worker accounting remains exact while writers and snapshots ru
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     std::vector<std::string> workers;
     std::vector<stats::WorkerAccountingHandle> accounting;
@@ -1575,7 +2037,7 @@ TEST_CASE("a connected overflow worker stays attached to its canonical bare buck
     config.max_workers_per_address = 2;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
 
     std::vector<std::shared_ptr<stratum::Session>> sessions;
     for (const std::string worker : {"w1", "w2", "overflow"}) {
@@ -1602,7 +2064,7 @@ TEST_CASE("per-worker bestshare is the actual hash difficulty, not the credited 
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     pool.note_accepted_share(kAddr, "w1", /*credited=*/8.0, /*share_difficulty=*/5000.0);
     pool.note_accepted_share(kAddr, "w1", /*credited=*/8.0, /*share_difficulty=*/120.0);
     const auto rows = workers_of(pool.snapshot(true), kAddr);
@@ -1615,7 +2077,7 @@ TEST_CASE("a worker row persists in the registry after its connection ends") {
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     pool.note_accepted_share(kAddr, "rig", 4.0, 4.0);
 
     // snapshot() has no live clients (none were attached), yet the row is present: persistence.
@@ -1630,7 +2092,7 @@ TEST_CASE("attach_worker creates a zero row so an idle authorized worker appears
     Config config;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     pool.attach_worker(kAddr, "idle");
     const auto rows = workers_of(pool.snapshot(true), kAddr);
     REQUIRE(rows.size() == 1);
@@ -1643,7 +2105,7 @@ TEST_CASE("worker names beyond max_workers_per_address fold into the bare-addres
     config.max_workers_per_address = 2;
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool pool(config, rpc_source);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
     pool.note_accepted_share(kAddr, "w1", 1.0, 1.0);
     pool.note_accepted_share(kAddr, "w2", 1.0, 1.0);
     pool.note_accepted_share(kAddr, "w3", 7.0, 7.0); // over the cap -> folds into ""
@@ -1669,7 +2131,7 @@ TEST_CASE("recover_user_stats re-seeds the registry from users/ files, decayed b
         wcfg.stats_directory = dir.string();
         bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-        Pool writer(wcfg, rpc_source);
+        Pool writer(wcfg, rpc_source, test::kWorkGeneration);
         for (int i = 0; i < 20; ++i)
             writer.note_accepted_share(kAddr, "rig", 1000.0, 1000.0); // build up some hashrate
         const auto snap = writer.snapshot(/*include_workers=*/true);
@@ -1682,7 +2144,7 @@ TEST_CASE("recover_user_stats re-seeds the registry from users/ files, decayed b
     rcfg.stats_directory = dir.string();
     bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
     bitcoin::RpcWorkSource rpc_source(rpc);
-    Pool reader(rcfg, rpc_source);
+    Pool reader(rcfg, rpc_source, test::kWorkGeneration);
     reader.recover_user_stats();
 
     const auto rows = workers_of(reader.snapshot(true), kAddr);

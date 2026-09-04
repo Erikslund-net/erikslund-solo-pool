@@ -46,6 +46,13 @@ jobs:
           docker build -t erikslund-pool-build docker
           docker run --rm -v "$PWD:/src:ro" \
             -v erikslund-build:/build erikslund-pool-build
+      - name: Test as the unprivileged production user
+        run: |
+          docker run --rm --user 1000:1000 --cap-drop ALL \
+            --security-opt no-new-privileges:true --network none \
+            --read-only --tmpfs /tmp \
+            -v "$PWD:/src:ro" -v erikslund-build:/build:ro \
+            --entrypoint /build/cmake/erikslund_tests erikslund-pool-build
 
   noise-core:
     runs-on: ubuntu-latest

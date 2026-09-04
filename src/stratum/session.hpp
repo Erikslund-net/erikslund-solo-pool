@@ -134,9 +134,8 @@ private:
     void send_result(const glz::generic& id, bool result); // fast path: straight to the wire
     void send_error(const glz::generic& id, const StratumError& error);
 
-    // Canonical (lowercase, fixed-width) dedup key so different spellings of one share collapse;
-    // see make_dedup_key in the .cpp for why it stays an exact string.
-    std::string make_dedup_key(const std::string& job_id, std::string_view extranonce2,
+    // Different wire spellings of the same header share one key.
+    std::string make_dedup_key(const Job& job, std::string_view extranonce2,
                                std::string_view ntime, std::string_view nonce,
                                const std::optional<std::string>& version_bits) const;
     void record_accepted_share_locked(double credited, double share_difficulty);

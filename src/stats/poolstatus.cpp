@@ -266,9 +266,9 @@ glz::generic build_pool_status(const api::PoolSnapshot& snapshot) {
     glz::generic shares = glz::generic::object_t{};
     // Decimal-valued fields retain ".0" when integral; counts remain integers.
     shares["best_share_percent"] = format_json_number(best_share_percent);
-    shares["accepted"] = static_cast<double>(static_cast<int64_t>(snapshot.accepted_diff));
+    shares["accepted"] = snapshot.accepted_diff;
     shares["rejected"] = static_cast<double>(static_cast<int64_t>(snapshot.shares_rejected));
-    shares["bestshare"] = static_cast<double>(static_cast<int64_t>(snapshot.best_share));
+    shares["bestshare"] = snapshot.best_share;
     for (std::size_t i = 0; i < kSpsWindows.size(); ++i)
         shares[std::string("shares_per_second_") + kSpsLabels[i]] =
             format_json_number(round5(snapshot.sps_windows[i]));

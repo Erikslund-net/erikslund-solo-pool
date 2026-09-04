@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "core/logging.hpp"
+#include "util/checked_counter.hpp"
 #include "util/difficulty.hpp"
 
 namespace erikslund::sv2 {
@@ -32,6 +33,15 @@ constexpr double kJobRefreshSeconds =
 template <typename Message>
 void append_message(Bytes& destination, const Message& message) {
     append(destination, encode_message(message));
+}
+
+uint32_t maximum_ntime(uint32_t minimum_ntime, double started_at_steady,
+                        double now_steady) {
+    const double elapsed = std::max(0.0, now_steady - started_at_steady);
+    const uint64_t maximum = static_cast<uint64_t>(minimum_ntime) +
+                             static_cast<uint64_t>(elapsed);
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        maximum, std::numeric_limits<uint32_t>::max()));
 }
 
 } // namespace
@@ -105,8 +115,12 @@ void Session::update_job_refresh_requirement_locked(
 }
 
 Bytes Session::allocate_extranonce_prefix_locked() {
-    ++extranonce_counter_;
     const std::size_t suffix_size = pool_.extranonce2_size();
+    if (extranonce_counter_ >= util::counter_maximum(suffix_size)) {
+        close_after_response_ = true;
+        throw std::overflow_error("SV2 extranonce space exhausted; reconnect required");
+    }
+    ++extranonce_counter_;
     Bytes prefix = extranonce1_;
     prefix.resize(prefix.size() + suffix_size);
     for (std::size_t index = 0; index < suffix_size; ++index)
@@ -116,10 +130,11 @@ Bytes Session::allocate_extranonce_prefix_locked() {
 }
 
 uint32_t Session::allocate_job_id_locked() {
-    const uint32_t job_id = next_job_id_++;
-    if (next_job_id_ == 0)
-        next_job_id_ = 1;
-    return job_id;
+    if (next_job_id_ == 0) {
+        close_after_response_ = true;
+        throw std::overflow_error("SV2 job IDs exhausted; reconnect required");
+    }
+    return next_job_id_++;
 }
 
 void Session::rotate_share_history_for_clean_job_locked(
@@ -336,6 +351,12 @@ void Session::open_channel_locked(uint32_t request_id, std::string_view user_ide
             OpenMiningChannelError{request_id, "channel-limit-reached"}));
         return;
     }
+    // Standard counters and Extended prefixes can overlap even after channels close.
+    if (channel_kind_ && *channel_kind_ != kind) {
+        send_locked(encode_message(
+            OpenMiningChannelError{request_id, "channel-type-change-requires-reconnect"}));
+        return;
+    }
     if (!std::isfinite(nominal_hash_rate) || nominal_hash_rate < 0.0F ||
         static_cast<double>(nominal_hash_rate) > maximum_hash_rate(kind)) {
         ++protocol_errors_;
@@ -410,6 +431,7 @@ void Session::open_channel_locked(uint32_t request_id, std::string_view user_ide
         throw std::logic_error("SV2 channel ID collision");
     Channel& opened_channel = channel_entry->second;
     ++next_channel_id_;
+    channel_kind_ = kind;
     ever_authorized_ = true;
 
     if (kind == ChannelKind::Standard) {
@@ -545,16 +567,31 @@ void Session::build_job_work(JobBuildPlan& plan) {
 }
 
 void Session::commit_job_locked(Channel& channel, JobBuildPlan&& plan, bool clean) {
-    const bool clean_job =
-        clean || requires_new_prevhash_locked(channel, *plan.source_job);
-    if (clean_job) {
+    const double now_steady = stats::steady_seconds();
+    const bool new_prevhash = requires_new_prevhash_locked(channel, *plan.source_job);
+    const bool clean_job = clean || new_prevhash ||
+        plan.source_job->curtime() >
+            maximum_ntime(channel.previous_hash_minimum_ntime,
+                          channel.previous_hash_received_at_steady, now_steady);
+    if (new_prevhash) {
         rotate_share_history_for_clean_job_locked(plan.source_job);
         channel.jobs.clear();
     }
+    if (clean_job) {
+        channel.previous_hash = plan.source_job->prevhash_internal();
+        channel.previous_bits = plan.source_job->bits();
+        channel.previous_hash_minimum_ntime = plan.source_job->curtime();
+        channel.previous_hash_received_at_steady = now_steady;
+    }
+    const uint32_t job_minimum_ntime =
+        std::max(plan.source_job->curtime(), channel.previous_hash_minimum_ntime);
+    // Late same-parent shares retain the timestamp window they were issued with.
     auto issued = std::make_shared<IssuedJob>(
         IssuedJob{plan.source_job, std::move(plan.work),
                   std::move(plan.extranonce_prefix), plan.extranonce_size,
-                  channel.target, plan.source_job->curtime(), clean_job});
+                  channel.target, job_minimum_ntime,
+                  channel.previous_hash_minimum_ntime,
+                  channel.previous_hash_received_at_steady, clean_job});
     const IssuedJob& issued_job = *issued;
     channel.jobs.emplace_back(plan.job_id, std::move(issued));
     while (channel.jobs.size() > kMaximumIssuedJobs)
@@ -564,7 +601,7 @@ void Session::commit_job_locked(Channel& channel, JobBuildPlan&& plan, bool clea
     const std::optional<uint32_t> minimum_ntime =
         clean_job
             ? std::nullopt
-            : std::optional<uint32_t>(plan.source_job->curtime());
+            : std::optional<uint32_t>(job_minimum_ntime);
     if (channel.kind == ChannelKind::Standard) {
         const auto& standard = std::get<stratum::StandardWork>(issued_job.work);
         if (plan.announce_extranonce_prefix) {
@@ -590,14 +627,8 @@ void Session::commit_job_locked(Channel& channel, JobBuildPlan&& plan, bool clea
                   plan.source_job->prevhash_internal().end(),
                   previous_hash.begin());
         append_message(outbound, SetNewPrevHash{channel.id, plan.job_id, previous_hash,
-                                                plan.source_job->curtime(),
+                                                job_minimum_ntime,
                                                 plan.source_job->bits()});
-        channel.previous_hash = plan.source_job->prevhash_internal();
-        channel.previous_bits = plan.source_job->bits();
-        channel.previous_hash_minimum_ntime =
-            plan.source_job->curtime();
-        channel.previous_hash_received_at_steady =
-            stats::steady_seconds();
     }
     send_locked(outbound);
 }
@@ -834,21 +865,10 @@ std::optional<Session::PreparedShare> Session::prepare_share_locked(
         return std::nullopt;
     }
 
-    const double seconds_since_prevhash =
-        std::max(0.0, stats::steady_seconds() -
-                          channel.previous_hash_received_at_steady);
-    const uint64_t maximum_ntime_before_clamp =
-        static_cast<uint64_t>(channel.previous_hash_minimum_ntime) +
-        static_cast<uint64_t>(seconds_since_prevhash);
-    const uint32_t maximum_ntime =
-        static_cast<uint32_t>(std::min<uint64_t>(
-            maximum_ntime_before_clamp,
-            std::numeric_limits<uint32_t>::max()));
-    const uint32_t minimum_ntime =
-        std::max(channel.previous_hash_minimum_ntime,
-                 issued_job->minimum_ntime);
-    if (channel.previous_hash.empty() || share.ntime < minimum_ntime ||
-        share.ntime > maximum_ntime) {
+    if (share.ntime < issued_job->minimum_ntime ||
+        share.ntime > maximum_ntime(issued_job->previous_hash_minimum_ntime,
+                                    issued_job->previous_hash_received_at_steady,
+                                    stats::steady_seconds())) {
         reject_share_locked(&channel, share, "invalid-ntime",
                             stratum::RejectClass::Ntime);
         return std::nullopt;

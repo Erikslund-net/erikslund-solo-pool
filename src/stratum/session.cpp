@@ -8,6 +8,7 @@
 #include <ctime>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -34,7 +35,7 @@ void append_lower(std::string& out, std::string_view value) {
 // Append `value` lowercased and left-zero-padded to `width` hex chars. ONLY for fixed-width
 // 4-byte fields (ntime/nonce/version), where a leading-zero spelling IS the same value.
 void append_canonical_hex(std::string& out, std::string_view value, size_t width) {
-    if (value.size() < width)
+    if (!value.empty() && value.size() < width)
         out.append(width - value.size(), '0');
     append_lower(out, value);
 }
@@ -83,10 +84,11 @@ std::optional<double> difficulty_from_password(std::string_view password) {
 
 double vardiff_next(double current, double shares_per_minute, double target, double min_difficulty,
                     double max_difficulty) {
-    const double difficulty_cap = max_difficulty > 0.0 ? max_difficulty : 1e12;
+    const double difficulty_cap =
+        max_difficulty > 0.0 ? max_difficulty : std::numeric_limits<double>::max();
     current = std::clamp(current, min_difficulty, difficulty_cap);
     if (shares_per_minute > target * 2.0 && current < difficulty_cap)
-        return std::min(difficulty_cap, current * 2.0);
+        return current >= difficulty_cap / 2.0 ? difficulty_cap : current * 2.0;
     if (shares_per_minute < target / 2.0)
         return std::max(min_difficulty, current / 2.0);
     return current;
@@ -512,7 +514,7 @@ void Session::handle_submit(const json& id, const std::vector<std::string>& para
             return;
         }
 
-        if (!remember(make_dedup_key(job_id, extranonce2, ntime, nonce, version_bits))) [[unlikely]] {
+        if (!remember(make_dedup_key(*job, extranonce2, ntime, nonce, version_bits))) [[unlikely]] {
             ++shares_rejected_;
             pool_.note_rejected_share(worker_accounting_, or_empty(address_), or_empty(worker_),
                                       RejectClass::Duplicate);
@@ -606,15 +608,12 @@ void Session::record_accepted_share_locked(double credited, double share_difficu
     best_difficulty_ = std::max(best_difficulty_, share_difficulty);
 }
 
-std::string Session::make_dedup_key(const std::string& job_id, std::string_view extranonce2,
+std::string Session::make_dedup_key(const Job& job, std::string_view extranonce2,
                                     std::string_view ntime, std::string_view nonce,
                                     const std::optional<std::string>& version_bits) const {
-    // job_id/extranonce2 are length-meaningful -> lowercase only. ntime/nonce/version are 4-byte
-    // fields -> pad to 8 so leading-zero spellings collapse. version_mask is part of the work
-    // identity (same raw bits under a different mask = a different header), so include it.
     std::string key;
-    key.reserve(job_id.size() + extranonce2.size() + 40);
-    append_lower(key, job_id);
+    key.reserve(job.job_id().size() + extranonce2.size() + 40);
+    append_lower(key, job.job_id());
     key.push_back('|');
     append_lower(key, extranonce2);
     key.push_back('|');
@@ -622,10 +621,19 @@ std::string Session::make_dedup_key(const std::string& job_id, std::string_view 
     key.push_back('|');
     append_canonical_hex(key, nonce, 8);
     key.push_back('|');
-    if (version_bits)
-        append_canonical_hex(key, *version_bits, 8);
-    key.push_back('|');
-    std::format_to(std::back_inserter(key), "{:08x}", version_mask_);
+    uint32_t version = job.version();
+    if (version_bits) {
+        const auto rolled = util::try_parse_hex_u32(*version_bits);
+        if (!rolled || (*rolled & ~version_mask_) != 0) {
+            // Invalid attempts must not reserve the key of a valid header.
+            key += "invalid|";
+            append_lower(key, *version_bits);
+            std::format_to(std::back_inserter(key), "|{:08x}", version_mask_);
+            return key;
+        }
+        version = (version & ~version_mask_) | *rolled;
+    }
+    std::format_to(std::back_inserter(key), "{:08x}", version);
     return key;
 }
 

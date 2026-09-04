@@ -12,45 +12,43 @@ namespace erikslund::bitcoin {
 BlockTemplate IpcWorkSource::fetch_template() {
     if (stopping_.load(std::memory_order_acquire))
         throw RpcConnectionError("IPC work source is stopping");
-    if (auto failback_template = rpc_.try_fetch_failback_template())
-        return std::move(*failback_template);
-    if (!client_.available()) {
+    if (auto failback_template = rpc_.try_fetch_failback_template()) {
         ipc_active_.store(false, std::memory_order_relaxed);
-        return rpc_.fetch_template();
+        return std::move(*failback_template);
     }
-    BlockTemplate block_template;
+    if (!client_.available())
+        return fetch_rpc_template();
     try {
-        block_template = client_.create_block();
+        auto block_template = client_.create_block();
+        const MiningTip tip = rpc_.get_mining_tip();
+        if (stopping_.load(std::memory_order_acquire))
+            throw RpcConnectionError("IPC work source is stopping");
+        if (block_template.previousblockhash != tip.hash) {
+            log::debug("IPC template parent {} is not the RPC tip {}; using RPC for this cycle",
+                       block_template.previousblockhash, tip.hash);
+        } else {
+            if (block_template.height <= 0 || block_template.height - 1 != tip.height)
+                throw RpcError("IPC template height does not follow the RPC tip height");
+            failure_reported_ = false;
+            if (!ipc_active_.exchange(true, std::memory_order_relaxed))
+                log::info("IPC work source active");
+            return block_template;
+        }
     } catch (const std::exception& e) {
         ipc_active_.store(false, std::memory_order_relaxed);
         if (stopping_.load(std::memory_order_acquire))
             throw;
-        log::warning("IPC fetch_template failed ({}); using RPC for work", e.what());
-        return rpc_.fetch_template();
+        if (!std::exchange(failure_reported_, true))
+            log::warning("IPC work unavailable ({}); using RPC for work", e.what());
     }
-    const std::string expected_tip = rpc_.get_tip();
-    if (block_template.previousblockhash != expected_tip) {
-        log::debug("IPC template parent {} is not the RPC tip {}; using RPC for this cycle",
-                   block_template.previousblockhash, expected_tip);
-        return rpc_.fetch_template();
-    }
+    return fetch_rpc_template();
+}
 
-    const HeaderFacts tip = rpc_.fetch_header(expected_tip);
-    if (tip.confirmations != 1) {
-        log::debug("RPC tip {} changed during IPC template validation; using RPC for this cycle",
-                   expected_tip);
-        return rpc_.fetch_template();
-    }
-    if (block_template.height <= 0 || block_template.height - 1 != tip.height) {
-        ipc_active_.store(false, std::memory_order_relaxed);
-        log::warning("IPC template height {} does not follow RPC tip height {}; using RPC for work",
-                     block_template.height, tip.height);
-        return rpc_.fetch_template();
-    }
-
-    if (!ipc_active_.exchange(true, std::memory_order_relaxed))
-        log::info("IPC work source active");
-    return block_template;
+BlockTemplate IpcWorkSource::fetch_rpc_template() {
+    ipc_active_.store(false, std::memory_order_relaxed);
+    if (stopping_.load(std::memory_order_acquire))
+        throw RpcConnectionError("IPC work source is stopping");
+    return rpc_.fetch_template();
 }
 
 std::vector<std::string> IpcWorkSource::endpoint_urls() const {

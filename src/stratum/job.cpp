@@ -22,6 +22,8 @@ namespace {
 
 constexpr int64_t kNtimeSlack = 7200;
 constexpr int64_t kNtimeSubmitMargin = 120;
+constexpr size_t kMaximumDirectPushSize = 75;
+constexpr uint8_t kOpPushData1 = 0x4c;
 
 std::unexpected<ShareRejection> rejected(ShareReject reason) {
     return std::unexpected(ShareRejection{reason});
@@ -84,7 +86,7 @@ RejectClass reject_class_of(ShareReject reject) {
 
 Job::Job(std::string job_id, bitcoin::BlockTemplate block_template, ByteView tag,
          size_t extranonce1_size, size_t extranonce2_size, uint32_t coinbase_version, bool clean,
-         ByteView donation_script, double donation_percent)
+         ByteView donation_script, double donation_percent, ByteView work_identifier)
     : job_id_(std::move(job_id)),
       clean_(clean),
       height_(block_template.height),
@@ -116,8 +118,19 @@ Job::Job(std::string job_id, bitcoin::BlockTemplate block_template, ByteView tag
 
     if (block_template.coinbase_script_sig_prefix.empty())
         throw std::invalid_argument("coinbase scriptSig prefix is empty");
+    append(tag_, work_identifier);
+    Bytes script_sig_prefix = std::move(block_template.coinbase_script_sig_prefix);
+    if (!work_identifier.empty()) {
+        // Keep changing extranonce and identifier bytes inert under sigop counting.
+        const size_t data_size = extranonce_size_ + tag_.size();
+        if (data_size > bitcoin::kMaxScriptSig)
+            throw std::invalid_argument("coinbase data exceeds scriptSig budget");
+        if (data_size > kMaximumDirectPushSize)
+            script_sig_prefix.push_back(kOpPushData1);
+        script_sig_prefix.push_back(static_cast<uint8_t>(data_size));
+    }
     coinbase1_ = bitcoin::build_coinbase1(
-        block_template.coinbase_script_sig_prefix, extranonce1_size + extranonce2_size, tag,
+        script_sig_prefix, extranonce_size_, tag_,
         block_template.coinbase_version.value_or(coinbase_version));
     coinbase1_hex_ = util::to_hex(coinbase1_);
     version_hex_ = std::format("{:08x}", version_);
@@ -128,7 +141,8 @@ Job::Job(std::string job_id, bitcoin::BlockTemplate block_template, ByteView tag
     work_signature_ += '|' + nbits_hex_;
     work_signature_ += '|' + ntime_hex_;
     work_signature_ += '|' + coinbase1_hex_;
-    work_signature_ += '|' + util::to_hex(tag_);
+    // The per-job identifier must not defeat duplicate-template suppression.
+    work_signature_ += '|' + util::to_hex(tag);
     work_signature_ += '|' + std::to_string(coinbase_value_);
     work_signature_ += '|' + std::to_string(coinbase_sequence_);
     work_signature_ += '|' + std::to_string(coinbase_lock_time_);

@@ -16,6 +16,7 @@
 #include "bitcoin/work_source_rpc.hpp"
 #include "core/config.hpp"
 #include "pool/pool.hpp"
+#include "work_generation_fixture.hpp"
 #include "util/unique_fd.hpp"
 
 using namespace erikslund;
@@ -36,7 +37,7 @@ struct PoolFixture {
     Config config;
     bitcoin::RpcClient rpc{"http://127.0.0.1:1", "user", "pass"};
     bitcoin::RpcWorkSource source{rpc};
-    Pool pool{config, source};
+    Pool pool{config, source, test::kWorkGeneration};
     api::HttpServer server{pool, std::string(kLoopbackAddress), 0};
 
     PoolFixture() { server.start(); }

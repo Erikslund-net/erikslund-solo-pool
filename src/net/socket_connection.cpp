@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <utility>
 
@@ -43,6 +44,9 @@ std::string describe_peer(const sockaddr_storage& peer_address) {
 }
 
 int keepalive_user_timeout_ms(double work_rebroadcast_seconds) {
+    constexpr int kMaximumTimeout = std::numeric_limits<int>::max();
+    if (work_rebroadcast_seconds >= static_cast<double>(kMaximumTimeout) / 2000.0)
+        return kMaximumTimeout;
     const int window = kKeepaliveIdleSeconds + kKeepaliveIntervalSeconds * kKeepaliveProbeCount;
     const double seconds = std::max(static_cast<double>(window), 2.0 * work_rebroadcast_seconds);
     return static_cast<int>(seconds * 1000.0);

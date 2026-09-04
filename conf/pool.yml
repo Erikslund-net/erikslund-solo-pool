@@ -13,5 +13,6 @@ initial_difficulty: 10000
 minimum_difficulty: 1
 # extranonce1_size: 6
 # extranonce1_prefix: "0001"
+# Must be persistent and writable; also stores the startup work-generation counter.
 stats_directory: stats
 zmq_block_endpoint: tcp://bitcoind:28332

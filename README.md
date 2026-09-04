@@ -8,7 +8,7 @@ Solo mining means every block pays the miner's address in full, minus an optiona
 donation. The pool coordinates work but never divides rewards between miners.
 
 > **Warning:** This software builds and submits real Bitcoin blocks. Test with your
-> hardware on regtest, signet, or testnet before using mainnet.
+> hardware on regtest or testnet before using mainnet.
 
 ## Quick start
 
@@ -26,7 +26,13 @@ docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 The container runs as UID/GID 1000. Host directories must be writable by that user
-so the pool can persist statistics and spool found blocks.
+so the pool can reserve mining work, persist statistics, and spool found blocks.
+
+Graceful shutdown finishes in-flight submissions, then gives each queued live
+candidate or retry one final attempt before saving statistics. Each RPC has a
+timeout, but total shutdown time depends on the live backlog. Compose allows two
+minutes; increase `stop_grace_period` if needed. Any remaining spooled blocks are
+retried at startup.
 
 ## Configuration
 
@@ -51,6 +57,14 @@ zmq_block_endpoint: tcp://bitcoind:28332
 | `3334` | Optional TLS-wrapped Stratum V1 |
 | `4333` | Optional authenticated Stratum V2 |
 | `7777` | Status API, health checks, and Prometheus metrics |
+
+### Bitcoin Core IPC
+
+IPC templates are accepted only when their parent and height match the RPC node's
+tip. On mainnet, that node must also be synced and connected to peers. If RPC
+permissions are restricted, allow `getblockchaininfo` and `getconnectioncount`
+alongside the pool's other RPC methods. Readiness or validation failures use RPC
+`getblocktemplate` fallback; IPC is retried automatically.
 
 ### Reloading configuration
 

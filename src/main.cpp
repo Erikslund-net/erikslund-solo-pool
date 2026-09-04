@@ -25,6 +25,7 @@
 #include "core/errors.hpp"
 #include "core/logging.hpp"
 #include "core/version.hpp"
+#include "mining/work_identity.hpp"
 #include "net/server.hpp"
 #include "net/zmq_subscriber.hpp"
 #include "pool/pool.hpp"
@@ -159,7 +160,16 @@ int main(int argc, char** argv) {
             log::warning("Could not start IPC connection loop ({}); using RPC for work", e.what());
         }
     }
-    Pool pool(config, *source);
+    uint64_t work_generation;
+    try {
+        work_generation = mining::reserve_work_generation(config.stats_directory);
+        log::info("Reserved mining work generation {}", work_generation);
+    } catch (const std::exception& error) {
+        log::error("Cannot reserve mining work generation in {}: {}",
+                   config.stats_directory, error.what());
+        return 1;
+    }
+    Pool pool(config, *source, work_generation);
 
     // Install handlers before waiting on bitcoind so Ctrl-C / SIGTERM can interrupt the wait.
     // SIGPIPE ignored so a broken socket write never kills the process.
@@ -295,6 +305,15 @@ int main(int argc, char** argv) {
 
     server.run(stop.get_token());
     stop.request_stop();
+    watcher.join();
+    worker.join();
+    vardiff_thread.join();
+    status_thread.join();
+    if (api_thread.joinable())
+        api_thread.join();
+    if (zmq_thread.joinable())
+        zmq_thread.join();
+    pool.shutdown();
 
     log::info("Shutdown requested -- {} shares accepted, {} blocks found", pool.accepted_shares(),
               pool.blocks_found());

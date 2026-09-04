@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -27,8 +28,11 @@ using namespace erikslund::bitcoin;
 
 namespace {
 
-std::string rpc_template_body(std::string_view previous_block_hash) {
-    return std::string(R"({"result":{"height":171,"version":536870912,"curtime":1700000000,)") +
+const std::string kRpcTip(64, 'b');
+
+std::string rpc_template_body(std::string_view previous_block_hash, int64_t height = 171) {
+    return R"({"result":{"height":)" + std::to_string(height) +
+           R"(,"version":536870912,"curtime":1700000000,)" +
            R"("bits":"207fffff","coinbasevalue":5000000000,"previousblockhash":")" +
            std::string(previous_block_hash) + R"(","transactions":[]},"error":null,"id":1})";
 }
@@ -62,10 +66,17 @@ class FakeRpc final : public RpcClient {
 public:
     FakeRpc() : RpcClient("http://rpc", "user", "password", 1) {}
 
-    std::string tip = "rpc-tip";
+    std::string tip = kRpcTip;
     std::string chain = "regtest";
+    bool initial_block_download = false;
+    int connection_count = 1;
+    bool fail_chain_info = false;
+    bool fail_connections = false;
+    bool fail_template = false;
+    std::function<void()> on_chain_info;
     int64_t tip_confirmations = 1;
     int template_requests = 0;
+    int connection_requests = 0;
 
 protected:
     std::string post_one(const Resolved&, const std::string& payload, long,
@@ -74,9 +85,24 @@ protected:
             *http_status = 200;
         if (payload.find("getbestblockhash") != std::string::npos)
             return R"({"result":")" + tip + R"(","error":null,"id":1})";
-        if (payload.find("getblockchaininfo") != std::string::npos)
+        if (payload.find("getblockchaininfo") != std::string::npos) {
+            if (on_chain_info)
+                on_chain_info();
+            if (fail_chain_info)
+                throw RpcError("getblockchaininfo permission denied", -32601);
             return R"({"result":{"chain":")" + chain +
-                   R"(","blocks":170},"error":null,"id":1})";
+                   R"(","blocks":170,"bestblockhash":")" + tip +
+                   R"(","initialblockdownload":)" +
+                   (initial_block_download ? "true" : "false") +
+                   R"(},"error":null,"id":1})";
+        }
+        if (payload.find("getconnectioncount") != std::string::npos) {
+            ++connection_requests;
+            if (fail_connections)
+                throw RpcError("getconnectioncount permission denied", -32601);
+            return R"({"result":)" + std::to_string(connection_count) +
+                   R"(,"error":null,"id":1})";
+        }
         if (payload.find("getblockheader") != std::string::npos)
             return R"({"result":{"height":170,"confirmations":)" +
                    std::to_string(tip_confirmations) +
@@ -85,6 +111,8 @@ protected:
             return R"({"result":null,"error":null,"id":1})";
         if (payload.find("getblocktemplate") != std::string::npos) {
             ++template_requests;
+            if (fail_template)
+                throw RpcError("getblocktemplate permission denied", -32601);
             return rpc_template_body(std::string(64, 'a'));
         }
         throw std::runtime_error("unexpected RPC request");
@@ -113,6 +141,9 @@ protected:
             throw RpcConnectionError("primary unavailable");
         if (payload.find("getbestblockhash") != std::string::npos)
             return R"({"result":")" + tip + R"(","error":null,"id":1})";
+        if (payload.find("getblockchaininfo") != std::string::npos)
+            return R"({"result":{"chain":"regtest","blocks":170,"bestblockhash":")" +
+                   tip + R"("},"error":null,"id":1})";
         if (payload.find("getblocktemplate") != std::string::npos) {
             if (endpoint.url == "http://primary") {
                 ++primary_template_requests;
@@ -126,6 +157,61 @@ protected:
         if (payload.find("getblockheader") != std::string::npos)
             return R"({"result":{"height":170,"confirmations":1,"bits":"207fffff",)"
                    R"("mediantime":1700000000},"error":null,"id":1})";
+        throw std::runtime_error("unexpected RPC request");
+    }
+};
+
+class ReadinessRpc final : public RpcClient {
+public:
+    ReadinessRpc()
+        : RpcClient(std::vector<RpcEndpoint>{{"http://primary", "user", "password"},
+                                             {"http://backup", "user", "password"}}, 1) {}
+
+    bool primary_initial_download = false;
+    int primary_connections = 1;
+    bool primary_connection_error = false;
+    const std::string primary_tip = std::string(64, 'a');
+    const std::string backup_tip = std::string(64, 'b');
+    int primary_template_requests = 0;
+    int backup_template_requests = 0;
+    int backup_readiness_requests = 0;
+
+protected:
+    std::string post_one(const Resolved& endpoint, const std::string& payload, long,
+                         long* http_status) override {
+        if (http_status)
+            *http_status = 200;
+        const bool primary = endpoint.url == "http://primary";
+        const std::string& tip = primary ? primary_tip : backup_tip;
+        const int height = primary ? 170 : 180;
+        if (payload.find("getblockchaininfo") != std::string::npos) {
+            if (!primary)
+                ++backup_readiness_requests;
+            return R"({"result":{"chain":"main","blocks":)" + std::to_string(height) +
+                   R"(,"bestblockhash":")" + tip + R"(","initialblockdownload":)" +
+                   (primary && primary_initial_download ? "true" : "false") +
+                   R"(},"error":null,"id":1})";
+        }
+        if (payload.find("getconnectioncount") != std::string::npos) {
+            if (!primary)
+                ++backup_readiness_requests;
+            if (primary && primary_connection_error)
+                throw RpcConnectionError("primary peer query unavailable");
+            return R"({"result":)" + std::to_string(primary ? primary_connections : 1) +
+                   R"(,"error":null,"id":1})";
+        }
+        if (payload.find("getblocktemplate") != std::string::npos) {
+            if (primary) {
+                ++primary_template_requests;
+                if (primary_initial_download)
+                    throw RpcError("initial block download", -10);
+                if (primary_connections == 0)
+                    throw RpcError("not connected", -9);
+            } else {
+                ++backup_template_requests;
+            }
+            return rpc_template_body(tip, height + 1);
+        }
         throw std::runtime_error("unexpected RPC request");
     }
 };
@@ -205,9 +291,9 @@ Bytes serialized_block(ByteView transaction_count, ByteView transaction) {
 TEST_CASE("IpcWorkSource uses IPC only for templates") {
     Sources sources;
     sources.ipc.block_template.height = 171;
-    sources.ipc.block_template.previousblockhash = "rpc-tip";
+    sources.ipc.block_template.previousblockhash = kRpcTip;
 
-    CHECK(sources.source.get_tip() == "rpc-tip");
+    CHECK(sources.source.get_tip() == kRpcTip);
     CHECK(sources.source.fetch_template().height == 171);
 
     const ChainInfo chain = sources.source.detect_chain();
@@ -229,6 +315,7 @@ TEST_CASE("IpcWorkSource returns a valid failback template then resumes IPC") {
     ipc.block_template.height = 171;
     ipc.block_template.previousblockhash = rpc.tip;
 
+    CHECK(rpc.getbestblockhash() == rpc.tip);
     CHECK(source.fetch_template().previousblockhash == rpc.tip);
     CHECK(ipc.creates == 1);
     CHECK(source.active_index() == 0);
@@ -243,7 +330,7 @@ TEST_CASE("IpcWorkSource returns a valid failback template then resumes IPC") {
     CHECK(ipc.creates == 1);
     CHECK(rpc.primary_template_requests == 1);
     CHECK(rpc.backup_template_requests == 0);
-    CHECK(source.active_index() == 0);
+    CHECK(source.active_index() == 1);
 
     CHECK(source.fetch_template().previousblockhash == rpc.tip);
     CHECK(ipc.creates == 2);
@@ -258,6 +345,7 @@ TEST_CASE("a failed RPC failback candidate continues IPC without fetching from t
     ipc.block_template.height = 171;
     ipc.block_template.previousblockhash = rpc.tip;
 
+    CHECK(rpc.getbestblockhash() == rpc.tip);
     CHECK(source.fetch_template().previousblockhash == rpc.tip);
     REQUIRE(rpc.active_index() == 1);
     REQUIRE(ipc.creates == 1);
@@ -278,26 +366,24 @@ TEST_CASE("a failed RPC failback candidate continues IPC without fetching from t
     CHECK(rpc.primary_template_requests == 1);
 }
 
-// An IPC template that does not build on the RPC tip is rejected for THAT cycle only. A block
-// landing while create_block is in flight leaves the template one parent behind -- an ordinary
-// race, not a broken node -- so it must not retire a healthy IPC session.
 TEST_CASE("an IPC template on a different tip falls back for that cycle without reconnecting") {
     Sources sources;
     sources.ipc.block_template.height = 171;
-    sources.ipc.block_template.previousblockhash = "rpc-tip";
-    CHECK(sources.source.fetch_template().previousblockhash == "rpc-tip");
+    sources.ipc.block_template.previousblockhash = kRpcTip;
+    CHECK(sources.source.fetch_template().previousblockhash == kRpcTip);
     CHECK(sources.source.active_index() == 0);
 
     sources.ipc.block_template.previousblockhash = "stale-tip";
 
-    CHECK(sources.source.fetch_template().height == 171); // served by RPC
-    CHECK(sources.source.active_index() == 0);            // IPC session remains healthy
+    CHECK(sources.source.fetch_template().height == 171);
+    CHECK(sources.source.active_index() == 1);
+    CHECK(sources.ipc.available());
     CHECK(sources.source.endpoint_urls() ==
           std::vector<std::string>{"ipc:///tmp/mining.sock", "http://rpc"});
 
     // Once IPC agrees with the tip again its template is used, with no restart needed.
-    sources.ipc.block_template.previousblockhash = "rpc-tip";
-    CHECK(sources.source.fetch_template().previousblockhash == "rpc-tip");
+    sources.ipc.block_template.previousblockhash = kRpcTip;
+    CHECK(sources.source.fetch_template().previousblockhash == kRpcTip);
     CHECK(sources.source.active_index() == 0);
 }
 
@@ -319,7 +405,7 @@ TEST_CASE("IPC request failure uses RPC until a fresh session becomes available"
     sources.ipc.fail_template = false;
     sources.ipc.is_available = true;
     sources.ipc.block_template.height = 171;
-    sources.ipc.block_template.previousblockhash = "rpc-tip";
+    sources.ipc.block_template.previousblockhash = kRpcTip;
     CHECK(sources.source.fetch_template().height == 171);
     CHECK(sources.source.active_index() == 0);
     CHECK(sources.ipc.creates == 2);
@@ -338,7 +424,7 @@ TEST_CASE("a reconnected IPC session stays inactive until its template is curren
     CHECK(sources.source.active_index() == 1);
 
     sources.ipc.block_template.height = 171;
-    sources.ipc.block_template.previousblockhash = "rpc-tip";
+    sources.ipc.block_template.previousblockhash = kRpcTip;
     CHECK(sources.source.fetch_template().height == 171);
     CHECK(sources.source.active_index() == 0);
 }
@@ -346,7 +432,7 @@ TEST_CASE("a reconnected IPC session stays inactive until its template is curren
 TEST_CASE("an IPC template height must follow the authoritative RPC tip height") {
     Sources sources;
     sources.ipc.block_template.height = 171;
-    sources.ipc.block_template.previousblockhash = "rpc-tip";
+    sources.ipc.block_template.previousblockhash = kRpcTip;
     CHECK(sources.source.fetch_template().height == 171);
     CHECK(sources.source.active_index() == 0);
 
@@ -365,16 +451,17 @@ TEST_CASE("an IPC template height must follow the authoritative RPC tip height")
 TEST_CASE("a tip change during IPC validation falls back for that cycle") {
     Sources sources;
     sources.ipc.block_template.height = 171;
-    sources.ipc.block_template.previousblockhash = "rpc-tip";
-    CHECK(sources.source.fetch_template().previousblockhash == "rpc-tip");
+    sources.ipc.block_template.previousblockhash = kRpcTip;
+    CHECK(sources.source.fetch_template().previousblockhash == kRpcTip);
     CHECK(sources.source.active_index() == 0);
 
-    sources.rpc.tip_confirmations = 2;
+    sources.rpc.tip = std::string(64, 'c');
     CHECK(sources.source.fetch_template().previousblockhash == std::string(64, 'a'));
-    CHECK(sources.source.active_index() == 0); // healthy IPC session remains armed
+    CHECK(sources.source.active_index() == 1);
+    CHECK(sources.ipc.available());
 
-    sources.rpc.tip_confirmations = 1;
-    CHECK(sources.source.fetch_template().previousblockhash == "rpc-tip");
+    sources.rpc.tip = kRpcTip;
+    CHECK(sources.source.fetch_template().previousblockhash == kRpcTip);
     CHECK(sources.source.active_index() == 0);
 }
 
@@ -384,6 +471,111 @@ TEST_CASE("IpcWorkSource forwards shutdown interruption") {
     CHECK(sources.ipc.interrupts == 1);
     sources.source.interrupt();
     CHECK(sources.ipc.interrupts == 1);
+}
+
+TEST_CASE("mainnet IPC requires a synced connected RPC tip") {
+    Sources sources;
+    sources.rpc.chain = "main";
+    sources.ipc.block_template.height = 171;
+    sources.ipc.block_template.previousblockhash = kRpcTip;
+
+    CHECK(sources.source.fetch_template().previousblockhash == kRpcTip);
+    CHECK(sources.source.active_index() == 0);
+    CHECK(sources.rpc.connection_requests == 1);
+    CHECK(sources.rpc.template_requests == 0);
+}
+
+TEST_CASE("IPC preserves Core's test-chain readiness exemption") {
+    for (const std::string chain : {"regtest", "test", "testnet4"}) {
+        CAPTURE(chain);
+        Sources sources;
+        sources.rpc.chain = chain;
+        sources.rpc.initial_block_download = true;
+        sources.rpc.connection_count = 0;
+        sources.ipc.block_template.height = 171;
+        sources.ipc.block_template.previousblockhash = kRpcTip;
+
+        CHECK(sources.source.fetch_template().previousblockhash == kRpcTip);
+        CHECK(sources.source.active_index() == 0);
+        CHECK(sources.rpc.connection_requests == 0);
+        CHECK(sources.rpc.template_requests == 0);
+    }
+}
+
+TEST_CASE("unready mainnet IPC falls back to a ready backup then recovers") {
+    FakeMiningClient ipc;
+    ReadinessRpc rpc;
+    RpcWorkSource rpc_source{rpc};
+    IpcWorkSource source{ipc, rpc_source, "ipc:///tmp/mining.sock"};
+    ipc.block_template.height = 171;
+    ipc.block_template.previousblockhash = rpc.primary_tip;
+    SUBCASE("initial block download") { rpc.primary_initial_download = true; }
+    SUBCASE("no peers") { rpc.primary_connections = 0; }
+
+    const auto fallback = source.fetch_template();
+    CHECK(fallback.height == 181);
+    CHECK(fallback.previousblockhash == rpc.backup_tip);
+    CHECK(rpc.primary_template_requests == 1);
+    CHECK(rpc.backup_template_requests == 1);
+    CHECK(rpc.active_index() == 1);
+    CHECK(source.active_index() == 2);
+    CHECK(ipc.available());
+
+    CHECK(source.fetch_template().previousblockhash == rpc.backup_tip);
+    CHECK(rpc.backup_template_requests == 2);
+    CHECK(source.active_index() == 2);
+
+    ipc.block_template.height = 181;
+    ipc.block_template.previousblockhash = rpc.backup_tip;
+    CHECK(source.fetch_template().previousblockhash == rpc.backup_tip);
+    CHECK(source.active_index() == 0);
+    CHECK(rpc.backup_template_requests == 2);
+}
+
+TEST_CASE("mining readiness never mixes answers from different RPC endpoints") {
+    ReadinessRpc rpc;
+    rpc.primary_connection_error = true;
+
+    CHECK_THROWS_AS(rpc.get_mining_tip(), RpcConnectionError);
+    CHECK(rpc.active_index() == 0);
+    CHECK(rpc.backup_readiness_requests == 0);
+}
+
+TEST_CASE("IPC validation failures fall back once and retry IPC without reconnecting") {
+    Sources sources;
+    sources.rpc.chain = "main";
+    sources.ipc.block_template.height = 171;
+    sources.ipc.block_template.previousblockhash = kRpcTip;
+    SUBCASE("chain information unavailable") { sources.rpc.fail_chain_info = true; }
+    SUBCASE("peer information unavailable") { sources.rpc.fail_connections = true; }
+
+    CHECK(sources.source.fetch_template().previousblockhash == std::string(64, 'a'));
+    CHECK(sources.rpc.template_requests == 1);
+    CHECK(sources.source.active_index() == 1);
+    CHECK(sources.ipc.available());
+
+    sources.rpc.fail_template = true;
+    CHECK_THROWS_AS(sources.source.fetch_template(), RpcError);
+    CHECK(sources.rpc.template_requests == 2);
+
+    sources.rpc.fail_chain_info = false;
+    sources.rpc.fail_connections = false;
+    CHECK(sources.source.fetch_template().previousblockhash == kRpcTip);
+    CHECK(sources.rpc.template_requests == 2);
+    CHECK(sources.source.active_index() == 0);
+}
+
+TEST_CASE("shutdown during IPC validation starts no final RPC template request") {
+    Sources sources;
+    sources.ipc.block_template.height = 171;
+    sources.ipc.block_template.previousblockhash = kRpcTip;
+    sources.rpc.on_chain_info = [&] { sources.source.interrupt(); };
+    SUBCASE("validation succeeds") {}
+    SUBCASE("validation fails") { sources.rpc.fail_chain_info = true; }
+
+    CHECK_THROWS(sources.source.fetch_template());
+    CHECK(sources.rpc.template_requests == 0);
+    CHECK(sources.source.active_index() == 1);
 }
 
 TEST_CASE("shutdown interrupts IPC without starting a final RPC template call") {

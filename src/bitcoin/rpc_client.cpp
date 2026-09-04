@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <future>
 #include <memory>
@@ -12,8 +13,10 @@
 
 #include <curl/curl.h>
 
+#include "bitcoin/network.hpp"
 #include "core/errors.hpp"
 #include "core/logging.hpp"
+#include "util/hex.hpp"
 #include "util/url.hpp"
 
 namespace erikslund::bitcoin {
@@ -117,15 +120,18 @@ std::vector<std::string> RpcClient::endpoint_urls() const {
     return urls;
 }
 
-glz::generic RpcClient::call(const std::string& method, const glz::generic& params, long timeout) {
+std::string RpcClient::make_payload(const std::string& method, const glz::generic& params) {
     const int id = ++next_id_;
     glz::generic request;
     request["jsonrpc"] = "1.0";
     request["id"] = static_cast<double>(id);
     request["method"] = method;
     request["params"] = params.is_null() ? glz::generic(glz::generic::array_t{}) : params;
-    const std::string payload = glz::write_json(request).value_or("");
-    return call_payload(payload, timeout > 0 ? timeout : timeout_);
+    return glz::write_json(request).value_or("");
+}
+
+glz::generic RpcClient::call(const std::string& method, const glz::generic& params, long timeout) {
+    return call_payload(make_payload(method, params), timeout > 0 ? timeout : timeout_);
 }
 
 glz::generic RpcClient::call_payload(const std::string& payload, long timeout) {
@@ -209,19 +215,15 @@ std::string RpcClient::make_getblocktemplate_payload() {
     glz::generic request;
     request["rules"] = glz::generic::array_t{"segwit"};
     request["capabilities"] = glz::generic::array_t{"coinbasetxn", "workid", "coinbase/append"};
-    glz::generic envelope;
-    envelope["jsonrpc"] = "1.0";
-    envelope["id"] = static_cast<double>(++next_id_);
-    envelope["method"] = "getblocktemplate";
-    envelope["params"] = glz::generic::array_t{request};
-    return glz::write_json(envelope).value_or("");
+    return make_payload("getblocktemplate", glz::generic::array_t{request});
 }
 
-BlockTemplate RpcClient::fetch_template_from(size_t index, const std::string& payload) {
+BlockTemplate RpcClient::fetch_template_from(size_t index, const std::string& payload,
+                                            std::string& response_body) {
     long http_status = 0;
-    gbt_body_ = post_one(endpoints_[index], payload, poll_timeout_, &http_status);
+    response_body = post_one(endpoints_[index], payload, poll_timeout_, &http_status);
     try {
-        return BlockTemplate::from_gbt(gbt_body_);
+        return BlockTemplate::from_gbt(response_body);
     } catch (const std::invalid_argument& error) {
         throw RpcConnectionError("unparseable body (HTTP " + std::to_string(http_status) +
                                  "): " + error.what());
@@ -241,7 +243,7 @@ BlockTemplate RpcClient::getblocktemplate_parsed() {
         const size_t index = (start + offset) % count;
         BlockTemplate block_template;
         try {
-            block_template = fetch_template_from(index, payload);
+            block_template = fetch_template_from(index, payload, gbt_body_);
         } catch (const RpcError& error) {
             if (!endpoint_unavailable(error))
                 throw;
@@ -328,6 +330,35 @@ std::string RpcClient::getbestblockhash() {
     return call("getbestblockhash", glz::generic{}, poll_timeout_).get<std::string>();
 }
 
+MiningTip RpcClient::get_mining_tip() {
+    const Resolved& endpoint = endpoints_[current_.load()];
+    const auto info = call_one(endpoint, make_payload("getblockchaininfo"), poll_timeout_);
+    if (!info.is_object() || !info.contains("chain") || !info["chain"].is_string() ||
+        !info.contains("blocks") || !info["blocks"].is_number() ||
+        !info.contains("bestblockhash") || !info["bestblockhash"].is_string())
+        throw RpcConnectionError("getblockchaininfo returned an invalid mining tip");
+
+    const auto network = network_from_string(info["chain"].get<std::string>());
+    const double height = info["blocks"].get<double>();
+    const auto& hash = info["bestblockhash"].get<std::string>();
+    if (!network || height < 0 || height > std::numeric_limits<int32_t>::max() ||
+        std::trunc(height) != height || hash.size() != 64 || !util::is_hex(hash))
+        throw RpcConnectionError("getblockchaininfo returned an invalid mining tip");
+
+    // Bitcoin Core's getblocktemplate exempts test chains from these readiness checks.
+    if (*network == Network::Mainnet) {
+        if (!info.contains("initialblockdownload") || !info["initialblockdownload"].is_boolean())
+            throw RpcConnectionError("getblockchaininfo omitted initialblockdownload");
+        if (info["initialblockdownload"].get<bool>())
+            throw RpcError("Bitcoin Core is in initial block download", kRpcClientInInitialDownload);
+        const auto connections =
+            call_one(endpoint, make_payload("getconnectioncount"), poll_timeout_);
+        if (!connections.is_number() || connections.get<double>() < 1)
+            throw RpcError("Bitcoin Core is not connected", kRpcClientNotConnected);
+    }
+    return {hash, static_cast<int64_t>(height)};
+}
+
 void RpcClient::maybe_failback(const std::string& expected_tip) {
     if (current_.load() == 0 || expected_tip.empty())
         return; // already on primary / no tip to compare against
@@ -336,39 +367,36 @@ void RpcClient::maybe_failback(const std::string& expected_tip) {
     if (now - last_failback_probe_.load() < kFailbackProbeSeconds)
         return;
     last_failback_probe_.store(now);
-    glz::generic request;
-    request["jsonrpc"] = "1.0";
-    request["id"] = static_cast<double>(++next_id_);
-    request["method"] = "getbestblockhash";
-    request["params"] = glz::generic::array_t{};
-    const std::string payload = glz::write_json(request).value_or("");
-    glz::generic result;
+    const std::string payload = make_payload("getbestblockhash");
     try {
-        result = call_one(endpoints_[0], payload, poll_timeout_);
+        const auto result = call_one(endpoints_[0], payload, poll_timeout_);
+        if (!result.is_string() || result.get<std::string>() != expected_tip)
+            return;
+        // The status thread probes recovery without blocking work from the active node.
+        std::string response_body;
+        auto block_template =
+            fetch_template_from(0, make_getblocktemplate_payload(), response_body);
+        if (block_template.previousblockhash != expected_tip)
+            return;
+        const std::scoped_lock lock(failback_mutex_);
+        failback_template_ = std::move(block_template);
     } catch (const std::exception&) {
         return;
-    }
-    if (!result.is_string() || result.get<std::string>() != expected_tip)
-        return;
-    {
-        const std::scoped_lock lock(failback_mutex_);
-        failback_expected_tip_ = expected_tip;
     }
 }
 
 std::optional<BlockTemplate> RpcClient::try_fetch_failback_template() {
-    std::optional<std::string> expected_tip;
+    std::optional<BlockTemplate> block_template;
     {
         const std::scoped_lock lock(failback_mutex_);
-        expected_tip = std::exchange(failback_expected_tip_, std::nullopt);
+        block_template = std::exchange(failback_template_, std::nullopt);
     }
-    if (!expected_tip || current_.load() == 0)
+    if (!block_template || current_.load() == 0)
         return std::nullopt;
 
     try {
-        BlockTemplate block_template =
-            fetch_template_from(0, make_getblocktemplate_payload());
-        if (block_template.previousblockhash != *expected_tip)
+        // A new tip may have arrived while the candidate waited for the next refresh.
+        if (block_template->previousblockhash != getbestblockhash())
             return std::nullopt;
         if (current_.exchange(0) != 0)
             log::info("bitcoind RPC failed back to the primary {}",

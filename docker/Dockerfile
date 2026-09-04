@@ -30,7 +30,7 @@ RUN apt-get update && apt-get dist-upgrade -y && apt-get install -y --no-install
 # Glaze (header-only: JSON/YAML/CBOR/... serialization + compile-time reflection): the JSON
 # parser/serializer the pool builds against. Header-only -> drop the include tree onto the
 # default search path (/usr/local/include); no link step.
-ARG GLAZE_VERSION=v8.2.0
+ARG GLAZE_VERSION=v8.3.0
 RUN git clone --depth 1 --branch "${GLAZE_VERSION}" https://github.com/stephenberry/glaze.git /tmp/glaze \
     && cp -r /tmp/glaze/include/glaze /usr/local/include/glaze \
     && rm -rf /tmp/glaze
@@ -60,7 +60,7 @@ RUN git clone --depth 1 --branch "${ERIKSLUND_HTTP_VERSION}" \
 
 # mimalloc (Microsoft): the interposed allocator. Built from a pinned release (like Glaze) instead
 # of the distro package -- installs libmimalloc.so + mimalloc.h to /usr/local (MI_INSTALL_TOPLEVEL).
-ARG MIMALLOC_VERSION=v3.5.0
+ARG MIMALLOC_VERSION=v3.5.1
 RUN git clone --depth 1 --branch "${MIMALLOC_VERSION}" https://github.com/microsoft/mimalloc.git /tmp/mimalloc \
     && cmake -S /tmp/mimalloc -B /tmp/mimalloc/build -DCMAKE_BUILD_TYPE=Release \
         -DMI_INSTALL_TOPLEVEL=ON -DMI_BUILD_TESTS=OFF \

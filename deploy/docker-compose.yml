@@ -9,6 +9,7 @@ services:
       dockerfile: Dockerfile
     image: erikslund-pool:latest
     restart: unless-stopped
+    stop_grace_period: 2m
     user: "1000:1000"
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]

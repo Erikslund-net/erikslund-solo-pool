@@ -58,23 +58,23 @@ TEST_CASE("donation_percent > 0 with no donation_address is a ConfigError (fail-
 }
 
 TEST_CASE("an over-long coinbase_signature (no room in the 100-byte scriptSig) is a ConfigError") {
-    // default extranonce1=4, extranonce2=8, height push budget 10 -> tag must be <= 78.
+    // Height(10) + extranonces(12) + identifier/framing(18) leaves 60 bytes.
     CHECK_THROWS_AS(Config::from_string(std::string(R"({"coinbase_signature": ")") +
-                                        std::string(79, 'x') + R"("})"),
+                                        std::string(61, 'x') + R"("})"),
                     ConfigError);
     CHECK_THROWS_AS(Config::from_string(std::string(R"({"coinbase_signature": ")") +
                                         std::string(500, 'x') + R"("})"),
                     ConfigError);
     CHECK_NOTHROW(Config::from_string(std::string(R"({"coinbase_signature": ")") +
-                                      std::string(78, 'x') + R"("})"));
+                                      std::string(60, 'x') + R"("})"));
 }
 
 TEST_CASE("the scriptSig budget also reflects larger extranonce sizes") {
-    // en1=8 + en2=8 + height 10 -> tag must be <= 74.
+    // Larger extranonces leave 56 bytes for the signature.
     CHECK_THROWS_AS(
         Config::from_string(std::string(R"({"extranonce1_size": 8, "extranonce2_size": 8, )"
                                         R"("coinbase_signature": ")") +
-                            std::string(75, 'x') + R"("})"),
+                            std::string(57, 'x') + R"("})"),
         ConfigError);
 }
 

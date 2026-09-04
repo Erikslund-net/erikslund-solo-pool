@@ -36,10 +36,10 @@ namespace {
 const Bytes kPayoutScript = util::from_hex("0014751e76e8199196d454941c45d1b3a323f1433bd6");
 const Bytes kOtherPayoutScript = util::from_hex("00140000000000000000000000000000000000000001");
 
-std::shared_ptr<Job> make_fake_job(uint32_t curtime) {
+std::shared_ptr<Job> make_fake_job(uint32_t curtime, uint32_t version = 0x20000000) {
     gbt_json t = gbt_json::object_t{};
     t["height"] = 200;
-    t["version"] = 0x20000000;
+    t["version"] = version;
     t["curtime"] = curtime;
     t["bits"] = std::string("207fffff"); // regtest-easy, so a share is cheap to accept
     t["coinbasevalue"] = 5000000000LL;
@@ -175,6 +175,18 @@ struct Fixture {
         session.handle_line(
             std::format(R"({{"id":3,"method":"mining.authorize","params":["{}","{}"]}})",
                         user, password));
+    }
+    void configure_mask(std::string_view mask) {
+        session.handle_line(std::format(
+            R"({{"id":2,"method":"mining.configure","params":[["version-rolling"],{{"version-rolling.mask":"{}"}}]}})",
+            mask));
+    }
+    void submit(int id, std::string_view nonce,
+                std::optional<std::string_view> version_bits = std::nullopt) {
+        const std::string version = version_bits ? std::format(",\"{}\"", *version_bits) : "";
+        session.handle_line(std::format(
+            R"({{"id":{},"method":"mining.submit","params":["w","job1","01020304","{}","{}"{}]}})",
+            id, pool.job->ntime_hex(), nonce, version));
     }
 };
 
@@ -419,6 +431,101 @@ TEST_CASE("a valid block share with mismatched username is dispatched, counted, 
     CHECK((*second)["error"][0].get<double>() == 22); // duplicate
     CHECK(f.pool.accepted == 1);        // not double-counted
     CHECK(f.pool.rejected == 1);        // the duplicate was counted as rejected
+}
+
+TEST_CASE("omitted and zero version bits deduplicate when the header is unchanged") {
+    Fixture f;
+    SUBCASE("without version rolling") {}
+    SUBCASE("with version rolling") { f.configure_mask("1fffe000"); }
+    f.subscribe();
+    f.authorize("validaddr.w");
+    const std::string nonce = find_accepted_nonce(
+        *f.pool.job, util::from_hex("e06ae06a"), f.pool.start_difficulty(), true);
+    REQUIRE_FALSE(nonce.empty());
+
+    f.submit(6, nonce);
+    REQUIRE(f.pool.block_found);
+    REQUIRE(f.pool.accepted == 1);
+    f.submit(7, nonce, "00000000");
+    const auto duplicate = f.conn.by_id(7);
+    REQUIRE(duplicate.has_value());
+    CHECK((*duplicate)["error"][0].get<double>() == 22);
+    CHECK(f.pool.accepted == 1);
+}
+
+TEST_CASE("mask renegotiation does not make the same header new work") {
+    Fixture f;
+    f.configure_mask("1fffe000");
+    f.subscribe();
+    f.authorize("validaddr.w");
+    const std::string nonce = find_accepted_nonce(
+        *f.pool.job, util::from_hex("e06ae06a"), f.pool.start_difficulty(), true);
+    REQUIRE_FALSE(nonce.empty());
+
+    f.submit(6, nonce, "00000000");
+    REQUIRE(f.pool.accepted == 1);
+    f.configure_mask("0fffe000");
+    REQUIRE(f.session.version_mask() == 0x0fffe000u);
+    f.submit(7, nonce, "0");
+    const auto duplicate = f.conn.by_id(7);
+    REQUIRE(duplicate.has_value());
+    CHECK((*duplicate)["error"][0].get<double>() == 22);
+    CHECK(f.pool.accepted == 1);
+}
+
+TEST_CASE("omitted version bits preserve rolled bits from the template") {
+    Fixture f;
+    f.pool.job = make_fake_job(f.curtime, 0x20002000);
+    f.configure_mask("1fffe000");
+    f.subscribe();
+    f.authorize("validaddr.w");
+    const std::string nonce = find_accepted_nonce(
+        *f.pool.job, util::from_hex("e06ae06a"), f.pool.start_difficulty(), true);
+    REQUIRE_FALSE(nonce.empty());
+
+    f.submit(6, nonce);
+    REQUIRE(f.pool.accepted == 1);
+    f.submit(7, nonce, "00002000");
+    const auto duplicate = f.conn.by_id(7);
+    REQUIRE(duplicate.has_value());
+    CHECK((*duplicate)["error"][0].get<double>() == 22);
+
+    f.submit(8, nonce, "00000000");
+    const auto different_header = f.conn.by_id(8);
+    REQUIRE(different_header.has_value());
+    CHECK(((*different_header)["error"].is_null() ||
+           (*different_header)["error"][0].get<double>() != 22));
+}
+
+TEST_CASE("invalid version bits cannot reserve the key of a valid block") {
+    Fixture f;
+    SUBCASE("without version rolling") {}
+    SUBCASE("with version rolling") { f.configure_mask("1fffe000"); }
+    f.subscribe();
+    f.authorize("validaddr.w");
+    const std::string nonce = find_accepted_nonce(
+        *f.pool.job, util::from_hex("e06ae06a"), f.pool.start_difficulty(), true);
+    REQUIRE_FALSE(nonce.empty());
+
+    for (const std::string_view bits : {"nothex", "00000001", "20000000"})
+        f.submit(6, nonce, bits);
+    CHECK(f.pool.accepted == 0);
+    CHECK(f.pool.rejected == 3);
+    f.submit(7, nonce);
+    CHECK(f.pool.accepted == 1);
+    CHECK(f.pool.block_found);
+}
+
+TEST_CASE("an empty nonce cannot reserve the key of a zero nonce") {
+    Fixture f;
+    f.subscribe();
+    f.authorize("validaddr.w");
+    f.submit(6, "");
+    f.submit(7, "00000000");
+    const auto valid_nonce = f.conn.by_id(7);
+    REQUIRE(valid_nonce.has_value());
+    CHECK(((*valid_nonce)["error"].is_null() ||
+           (*valid_nonce)["error"][0].get<double>() != 22));
 }
 
 TEST_CASE("a duplicate resubmitted across a clean job is still rejected (generation lookback)") {
@@ -712,9 +819,24 @@ TEST_CASE("vardiff_next band edges hold (strict comparisons)") {
     CHECK(vardiff_next(100, 5.99, 12, 0.001, 0) == doctest::Approx(50));
 }
 
-TEST_CASE("vardiff_next never exceeds the implicit 1e12 cap when no max is set") {
-    // current already at the implicit cap: a fast rate cannot push it higher.
-    CHECK(vardiff_next(1e12, 1000, 12, 0.001, 0) == doctest::Approx(1e12));
+TEST_CASE("vardiff_next has no implicit ceiling when maximum difficulty is zero") {
+    const Config config = Config::from_string(
+        R"({"minimum_difficulty":10000000000000,"maximum_difficulty":0})");
+    CHECK(vardiff_next(1e12, 1000, 12, 0.001, 0) == doctest::Approx(2e12));
+    CHECK(vardiff_next(1e13, 12, 12, config.minimum_difficulty,
+                      config.maximum_difficulty) == doctest::Approx(1e13));
+    CHECK(vardiff_next(1e13, 0, 12, config.minimum_difficulty,
+                      config.maximum_difficulty) == doctest::Approx(1e13));
+    CHECK(vardiff_next(1e13, 1000, 12, config.minimum_difficulty,
+                      config.maximum_difficulty) == doctest::Approx(2e13));
+}
+
+TEST_CASE("vardiff_next saturates without overflowing double") {
+    constexpr double kMaximum = std::numeric_limits<double>::max();
+    CHECK(vardiff_next(kMaximum / 2.0, 1000, 12, 0.001, 0) == kMaximum);
+    CHECK(vardiff_next(kMaximum * 0.75, 1000, 12, 0.001, 0) == kMaximum);
+    CHECK(vardiff_next(kMaximum, 1000, 12, 0.001, 0) == kMaximum);
+    CHECK(vardiff_next(kMaximum, 0, 12, 0.001, 0) == kMaximum / 2.0);
 }
 
 TEST_CASE("vardiff_next applies changed bounds while the share rate is in band") {

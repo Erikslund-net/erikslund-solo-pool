@@ -41,11 +41,14 @@ public:
     }
 
 private:
+    BlockTemplate fetch_rpc_template();
+
     MiningIpcClient& client_;
     RpcWorkSource& rpc_;
     std::string endpoint_label_;
     std::atomic<bool> ipc_active_{false};
     std::atomic<bool> stopping_{false};
+    bool failure_reported_ = false;
 };
 
 } // namespace erikslund::bitcoin

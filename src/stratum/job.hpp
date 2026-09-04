@@ -114,7 +114,8 @@ public:
     // Takes the template BY VALUE: its multi-MB tx blob is moved out, so callers pass an rvalue.
     Job(std::string job_id, bitcoin::BlockTemplate block_template, ByteView tag,
         size_t extranonce1_size, size_t extranonce2_size, uint32_t coinbase_version,
-        bool clean = true, ByteView donation_script = {}, double donation_percent = 0.0);
+        bool clean = true, ByteView donation_script = {}, double donation_percent = 0.0,
+        ByteView work_identifier = {});
 
     // mining.notify fields.
     const std::string& job_id() const { return job_id_; }
@@ -136,8 +137,7 @@ public:
     // True if this job mines on top of `tip_display_hex` (display-order hash from bitcoind).
     bool mines_on(const std::string& tip_display_hex) const;
 
-    // Identity of the mining work (ignores job_id/clean): equal signature => identical headers
-    // for any extranonce/nonce, so rebroadcasting the second only resets miners.
+    // Source-template identity; excludes wire handles and the per-job work identifier.
     const std::string& work_signature() const { return work_signature_; }
 
     Bytes build_coinbase2(ByteView payout_script) const;

@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> 1/5 compile + unit tests"
+echo "==> 1/6 compile + unit tests"
 docker build -q -t erikslund-pool-build "$REPO_ROOT/docker" >/dev/null
 if docker run --rm -v "$REPO_ROOT:/src:ro" \
         -v erikslund-build:/build \
@@ -44,7 +44,7 @@ else
     exit 1
 fi
 
-echo "==> 2/5 start regtest bitcoind"
+echo "==> 2/6 start regtest bitcoind"
 $COMPOSE up -d bitcoind >/dev/null 2>&1
 for _ in $(seq 1 40); do $CLI getblockchaininfo >/dev/null 2>&1 && break; sleep 1; done
 if START=$($CLI getblockcount 2>/dev/null); then
@@ -54,7 +54,7 @@ else
     exit 1
 fi
 
-echo "==> 3/5 start the C++ pool against bitcoind"
+echo "==> 3/6 start the C++ pool against bitcoind"
 docker rm -f "$POOL" >/dev/null 2>&1
 docker run -d --name "$POOL" --network "$NET" \
     -v erikslund-build:/build:ro \
@@ -75,7 +75,14 @@ else
     exit 1
 fi
 
-echo "==> 4/5 mine with a real cpuminer (up to ~45s, stops as soon as a block lands)"
+GENERATION_BEFORE=$(docker exec "$POOL" cat /stats/work-generation)
+if [ "$GENERATION_BEFORE" = "00000000000000000001" ]; then
+    pass "first startup reserved work generation 1"
+else
+    fail "unexpected first work generation: $GENERATION_BEFORE"
+fi
+
+echo "==> 4/6 mine with a real cpuminer (up to ~45s, stops as soon as a block lands)"
 $COMPOSE build miner >/dev/null 2>&1
 MINER_IMG=erikslund-miner:latest
 # Run the miner DETACHED and stop it with `docker rm -f` (SIGKILL). Never
@@ -92,7 +99,7 @@ for _ in $(seq 1 45); do
 done
 docker rm -f "$MINER" >/dev/null 2>&1
 
-echo "==> 5/5 verify a block was mined and accepted"
+echo "==> 5/6 verify a block was mined and accepted"
 END=$($CLI getblockcount 2>/dev/null || echo "$START")
 echo "  block height: $START -> $END"
 if [ "$END" -gt "$START" ]; then
@@ -105,6 +112,25 @@ if [[ "$POOL_LOGS" == *"BLOCK ACCEPTED"* ]]; then
     pass "pool logged BLOCK ACCEPTED"
 else
     fail "pool never logged BLOCK ACCEPTED"
+fi
+
+echo "==> 6/6 restart preserves and advances the work generation"
+docker restart -t 5 "$POOL" >/dev/null
+GENERATION_AFTER=""
+for _ in $(seq 1 30); do
+    GENERATION_AFTER=$(docker exec "$POOL" cat /stats/work-generation 2>/dev/null || true)
+    if [ "$GENERATION_AFTER" = "00000000000000000002" ] &&
+       docker exec "$POOL" curl -fsS http://127.0.0.1:7777/health >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if [ "$GENERATION_AFTER" = "00000000000000000002" ] &&
+   docker exec "$POOL" curl -fsS http://127.0.0.1:7777/health >/dev/null 2>&1; then
+    pass "pool restarted healthy with work generation 2"
+else
+    fail "pool did not restart with a new work generation"
+    docker logs --tail 40 "$POOL"
 fi
 
 echo

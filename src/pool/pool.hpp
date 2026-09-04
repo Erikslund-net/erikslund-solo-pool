@@ -47,7 +47,7 @@ class Session;
 
 class Pool : public stratum::PoolContext {
 public:
-    Pool(Config config, bitcoin::WorkSource& source);
+    Pool(Config config, bitcoin::WorkSource& source, uint64_t work_generation);
     ~Pool() override;
 
     // Set whether bitcoind can currently serve mining work.
@@ -59,6 +59,8 @@ public:
 
     void vardiff_loop(const std::stop_token& stop);
     void status_loop(const std::stop_token& stop);
+    // Call after the server and external pool loops have stopped.
+    void shutdown();
 
     void recover_stats();
     // Queue blocks spooled by a previous run for submission and retry.
@@ -147,14 +149,9 @@ private:
         std::string worker;
     };
 
-    struct LiveSubmission {
+    struct DeferredSubmission {
         std::shared_ptr<const PendingBlock> block;
-        std::chrono::steady_clock::time_point retry_after{};
-    };
-
-    struct RecoveredSubmission {
-        std::shared_ptr<const PendingBlock> block;
-        std::filesystem::path spool_path;
+        std::optional<std::filesystem::path> recovered_spool_path = std::nullopt;
         bool submitted_once = false;
         std::chrono::steady_clock::time_point retry_after{};
     };
@@ -171,9 +168,11 @@ private:
     void publication_loop(const std::stop_token& stop);
     Bytes next_extranonce1();
     void write_stats();
+    void stop_workers();
     void spool_block(const PendingBlock& block);
 
     Config config_;
+    const uint64_t work_generation_;
     bitcoin::WorkSource& source_;
     std::atomic<std::shared_ptr<const RuntimeConfig>> runtime_config_;
     bitcoin::Network network_ = bitcoin::Network::Regtest;
@@ -181,7 +180,7 @@ private:
     Bytes donation_script_;
 
     // mutex_ guards: clients_, blocks_by_address_, last_prevhash_, and the template bookkeeping
-    // below (has_template_/last_template_time_/last_version_/fastblock_pending_). blocks_by_address_
+    // below (has_template_/last_template_time_/last_version_). blocks_by_address_
     // and last_prevhash_ are under mutex_, NOT jobs_mutex_, despite sitting next to its fields.
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<ConnectedClient>> clients_;
@@ -241,7 +240,6 @@ private:
     bool has_template_ = false;
     uint32_t last_version_ = 0;
     std::string empty_commitment_;
-    bool fastblock_pending_ = false;
 
     std::atomic<double> last_broadcast_steady_{0.0};
 
@@ -260,12 +258,12 @@ private:
     void submit_loop(const std::stop_token& stop);
     std::mutex submit_mutex_;
     std::condition_variable_any submit_cv_;
-    std::deque<LiveSubmission> submit_queue_;
+    std::deque<std::shared_ptr<const PendingBlock>> submit_queue_;
 
     void recovery_loop(const std::stop_token& stop);
     std::mutex recovery_mutex_;
     std::condition_variable_any recovery_cv_;
-    std::deque<RecoveredSubmission> recovery_queue_;
+    std::deque<DeferredSubmission> recovery_queue_;
     std::set<std::filesystem::path> tracked_recovered_blocks_;
 
     std::mutex publication_mutex_;
@@ -280,7 +278,7 @@ private:
 // Whether one-block-ahead empty work is sound for the notified tip. confirmations == 1 (from
 // getblockheader) proves the notified hash IS the active tip now; >= 2 or -1 would build on a
 // superseded parent. Pure (exposed for tests).
-bool fastblock_eligible(bool has_template, bool fastblock_pending, const std::string& notified_tip,
+bool fastblock_eligible(bool has_template, const std::string& notified_tip,
                         const std::string& last_prevhash, int64_t next_height,
                         int64_t confirmations, const std::string& chain_name,
                         const std::string& bits_hex);

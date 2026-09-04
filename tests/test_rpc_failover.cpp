@@ -6,6 +6,7 @@
 //   * all endpoints down -> RpcConnectionError after trying each once.
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <map>
@@ -44,6 +45,7 @@ public:
     std::map<std::string, Mode> mode; // url -> behaviour
     std::map<std::string, int> hits;  // url -> times call_one ran
     glz::generic ok_result;           // when non-null, Mode::Ok returns this (e.g. a tip hash)
+    std::map<std::string, Mode> gbt_modes;
     std::map<std::string, std::string> gbt_tips;
 
 protected:
@@ -70,7 +72,8 @@ protected:
     std::string post_one(const Resolved& endpoint, const std::string&, long,
                          long*) override {
         ++hits[endpoint.url];
-        switch (mode.at(endpoint.url)) {
+        const auto behavior = gbt_modes.find(endpoint.url);
+        switch (behavior == gbt_modes.end() ? mode.at(endpoint.url) : behavior->second) {
         case Mode::Down:
             throw RpcConnectionError("down: " + endpoint.url);
         case Mode::WorkUnavailable:
@@ -83,6 +86,38 @@ protected:
         }
         return {};
     }
+};
+
+class BlockingFailbackRpc final : public RpcClient {
+public:
+    explicit BlockingFailbackRpc(const std::vector<RpcEndpoint>& endpoints)
+        : RpcClient(endpoints, 1), release_signal_(release_primary.get_future().share()) {}
+
+    std::atomic<bool> primary_available{false};
+    std::atomic<int> backup_template_requests{0};
+    std::promise<void> primary_called;
+    std::promise<void> release_primary;
+
+protected:
+    glz::generic call_one(const Resolved& endpoint, const std::string&, long) override {
+        if (endpoint.url == "http://primary" && !primary_available.load())
+            throw RpcConnectionError("primary unavailable");
+        return glz::generic(kTip);
+    }
+
+    std::string post_one(const Resolved& endpoint, const std::string&, long,
+                         long*) override {
+        if (endpoint.url == "http://primary") {
+            primary_called.set_value();
+            release_signal_.wait();
+        } else {
+            ++backup_template_requests;
+        }
+        return gbt_body(kTip);
+    }
+
+private:
+    std::shared_future<void> release_signal_;
 };
 
 const std::vector<RpcEndpoint> kEndpoints = {
@@ -187,7 +222,7 @@ TEST_CASE("endpoint_urls lists nodes in order; active_index tracks the current e
     CHECK(rpc.active_index() == 1); // advanced + stuck on backup1
 }
 
-TEST_CASE("maybe_failback schedules a primary GBT only after its tip catches up") {
+TEST_CASE("maybe_failback prepares a primary GBT only after its tip catches up") {
     ScriptedRpc rpc(kEndpoints);
     rpc.mode = {{"http://primary", ScriptedRpc::Mode::Down},
                 {"http://backup1", ScriptedRpc::Mode::Ok},
@@ -208,9 +243,11 @@ TEST_CASE("maybe_failback schedules a primary GBT only after its tip catches up"
         rpc.ok_result = kTip;
         rpc.maybe_failback(kTip);
         CHECK(rpc.active_index() == 1);
-        rpc.ok_result = glz::generic{};
+        const int primary_requests = rpc.hits["http://primary"];
         CHECK(rpc.getblocktemplate_parsed().previousblockhash == kTip);
+        CHECK(rpc.hits["http://primary"] == primary_requests);
         CHECK(rpc.active_index() == 0);
+        rpc.ok_result = glz::generic{};
         CHECK(rpc.call("getblockcount")["served_by"].get<std::string>() =="http://primary");
     }
     SUBCASE("an RPC error during the cheap probe does not schedule failback") {
@@ -227,30 +264,62 @@ TEST_CASE("maybe_failback schedules a primary GBT only after its tip catches up"
     SUBCASE("a candidate GBT error keeps serving from the active backup") {
         rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
         rpc.ok_result = kTip;
+        rpc.gbt_modes["http://primary"] = ScriptedRpc::Mode::RpcErr;
         rpc.maybe_failback(kTip);
-        rpc.mode["http://primary"] = ScriptedRpc::Mode::RpcErr;
-        rpc.ok_result = glz::generic{};
         CHECK(rpc.getblocktemplate_parsed().previousblockhash == kTip);
         CHECK(rpc.active_index() == 1);
     }
     SUBCASE("a candidate unavailable response keeps serving from the active backup") {
         rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
         rpc.ok_result = kTip;
+        rpc.gbt_modes["http://primary"] = ScriptedRpc::Mode::WorkUnavailable;
         rpc.maybe_failback(kTip);
-        rpc.mode["http://primary"] = ScriptedRpc::Mode::WorkUnavailable;
-        rpc.ok_result = glz::generic{};
         CHECK(rpc.getblocktemplate_parsed().previousblockhash == kTip);
         CHECK(rpc.active_index() == 1);
     }
     SUBCASE("a candidate template for a different tip keeps the active backup") {
         rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
         rpc.ok_result = kTip;
-        rpc.maybe_failback(kTip);
         rpc.gbt_tips["http://primary"] = std::string(64, 'b');
-        rpc.ok_result = glz::generic{};
+        rpc.maybe_failback(kTip);
         CHECK(rpc.getblocktemplate_parsed().previousblockhash == kTip);
         CHECK(rpc.active_index() == 1);
     }
+    SUBCASE("a cached candidate is discarded when the active tip advances") {
+        rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+        rpc.ok_result = kTip;
+        rpc.maybe_failback(kTip);
+        const std::string new_tip(64, 'b');
+        rpc.ok_result = new_tip;
+        rpc.gbt_tips["http://backup1"] = new_tip;
+        CHECK(rpc.getblocktemplate_parsed().previousblockhash == new_tip);
+        CHECK(rpc.active_index() == 1);
+    }
+}
+
+TEST_CASE("a blocked failback GBT does not delay templates from the active backup") {
+    using namespace std::chrono_literals;
+
+    BlockingFailbackRpc rpc(kEndpoints);
+    rpc.call("getblockcount");
+    REQUIRE(rpc.active_index() == 1);
+    rpc.primary_available = true;
+    auto primary_called = rpc.primary_called.get_future();
+    auto recovery = std::async(std::launch::async, [&rpc] { rpc.maybe_failback(kTip); });
+    const auto primary_status = primary_called.wait_for(1s);
+    auto work = std::async(std::launch::async, [&rpc] { return rpc.getblocktemplate_parsed(); });
+    const auto work_status = work.wait_for(1s);
+    rpc.release_primary.set_value();
+    recovery.get();
+    const auto block_template = work.get();
+
+    CHECK(primary_status == std::future_status::ready);
+    CHECK(work_status == std::future_status::ready);
+    CHECK(block_template.previousblockhash == kTip);
+    CHECK(rpc.backup_template_requests.load() == 1);
+    CHECK(rpc.active_index() == 1);
+    CHECK(rpc.getblocktemplate_parsed().previousblockhash == kTip);
+    CHECK(rpc.active_index() == 0);
 }
 
 TEST_CASE("maybe_failback is a no-op while already on the primary or with no tip yet") {

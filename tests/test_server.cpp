@@ -19,6 +19,8 @@
 #include "core/config.hpp"
 #include "net/server.hpp"
 #include "pool/pool.hpp"
+#include "util/unique_fd.hpp"
+#include "work_generation_fixture.hpp"
 
 using namespace erikslund;
 using namespace erikslund::net;
@@ -101,7 +103,7 @@ TEST_CASE("an explicit single worker is honored") {
 TEST_CASE("Server applies reloadable connection limits") {
     Config config;
     FinalSubmitWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     Server server(pool, config);
 
     RuntimeConfig replacement = config.runtime_config();
@@ -129,7 +131,7 @@ TEST_CASE("a final submit is processed before a disconnected client is removed")
     config.worker_threads = 1;
 
     FinalSubmitWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     pool.detect_network();
     Server server(pool, config);
     server.start();
@@ -157,6 +159,49 @@ TEST_CASE("a final submit is processed before a disconnected client is removed")
     std::jthread server_thread([&](const std::stop_token& stop) { server.run(stop); });
     CHECK(wait_until([&] { return pool.snapshot().shares_rejected == 1; }));
     CHECK(wait_until([&] { return pool.client_count() == 0; }));
+    server_thread.request_stop();
+    server_thread.join();
+}
+
+TEST_CASE("SV1 dispatches a limit-sized line before rejecting the next oversized line") {
+    Config config;
+    config.bind_host = "127.0.0.1";
+    config.bind_port = 0;
+    config.worker_threads = 1;
+    config.max_line_bytes = 128;
+
+    FinalSubmitWorkSource source;
+    Pool pool(config, source, test::kWorkGeneration);
+    pool.detect_network();
+    Server server(pool, config);
+    server.start();
+
+    const util::UniqueFd client(::socket(AF_INET, SOCK_STREAM, 0));
+    REQUIRE(client.get() >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(ServerTestPeek::listener_port(server));
+    REQUIRE(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+    REQUIRE(::connect(client.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+
+    std::string submit =
+        R"({"id":3,"method":"mining.submit","params":["worker","missing","00","00000000","00000000"]})";
+    submit.resize(config.max_line_bytes, ' ');
+    std::string oversized =
+        R"({"id":4,"method":"mining.submit","params":["worker","missing","00","00000000","00000000"]})";
+    oversized.resize(config.max_line_bytes + 1, ' ');
+    SUBCASE("completed line") { oversized += '\n'; }
+    SUBCASE("unterminated line") {}
+    const std::string requests =
+        R"({"id":1,"method":"mining.subscribe","params":["test"]}
+{"id":2,"method":"mining.authorize","params":["bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf.worker","x"]}
+)" + submit + '\n' + oversized;
+    REQUIRE(send_all(client.get(), requests));
+
+    std::jthread server_thread([&](const std::stop_token& stop) { server.run(stop); });
+    CHECK(wait_until([&] { return pool.snapshot().shares_rejected >= 1; }));
+    CHECK(wait_until([&] { return pool.client_count() == 0; }));
+    CHECK(pool.snapshot().shares_rejected == 1);
     server_thread.request_stop();
     server_thread.join();
 }

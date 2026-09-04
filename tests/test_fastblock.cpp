@@ -97,40 +97,35 @@ TEST_CASE("fastblock_eligible gates one-block-ahead empty work") {
     const std::string fresh = "22";  // a genuinely new tip from ZMQ
     const std::string kBits = "1d00ffff"; // the new tip's nBits, reused by the empty job
 
-    // Real template, not already pending, a new tip at the active head, mid-window -> eligible.
-    CHECK(fastblock_eligible(true, false, fresh, held, 101, 1, "main", kBits));
-    CHECK(fastblock_eligible(true, false, fresh, held, 101, 1, "regtest", kBits));
-    CHECK(fastblock_eligible(true, false, fresh, held, 101, 1, "signet", kBits));
+    CHECK(fastblock_eligible(true, fresh, held, 101, 1, "main", kBits));
+    CHECK(fastblock_eligible(true, fresh, held, 101, 1, "regtest", kBits));
+    CHECK(fastblock_eligible(true, fresh, held, 101, 1, "signet", kBits));
 
-    // Missing nBits must be gated here; parsing an empty value would wedge the pending latch.
     SUBCASE("no nBits for the new tip -> skip") {
-        CHECK_FALSE(fastblock_eligible(true, false, fresh, held, 101, 1, "main", ""));
+        CHECK_FALSE(fastblock_eligible(true, fresh, held, 101, 1, "main", ""));
     }
     SUBCASE("no template yet -> skip") {
-        CHECK_FALSE(fastblock_eligible(false, false, fresh, held, 101, 1, "main", kBits));
-    }
-    SUBCASE("already fastblocked off this template -> skip") {
-        CHECK_FALSE(fastblock_eligible(true, true, fresh, held, 101, 1, "main", kBits));
+        CHECK_FALSE(fastblock_eligible(false, fresh, held, 101, 1, "main", kBits));
     }
     SUBCASE("notification matches the held tip -> skip (the GBT already advanced)") {
-        CHECK_FALSE(fastblock_eligible(true, false, held, held, 101, 1, "main", kBits));
+        CHECK_FALSE(fastblock_eligible(true, held, held, 101, 1, "main", kBits));
     }
     SUBCASE("stale or superseded notification -> skip (not the active tip)") {
         // A delayed ZMQ notification: the hash already has a child (confirmations >= 2).
         // Building on it would put every miner on a superseded parent.
-        CHECK_FALSE(fastblock_eligible(true, false, fresh, held, 101, 2, "main", kBits));
+        CHECK_FALSE(fastblock_eligible(true, fresh, held, 101, 2, "main", kBits));
         // Reorged away entirely (-1) or unknown (0): never build on it.
-        CHECK_FALSE(fastblock_eligible(true, false, fresh, held, 101, -1, "main", kBits));
-        CHECK_FALSE(fastblock_eligible(true, false, fresh, held, 101, 0, "main", kBits));
+        CHECK_FALSE(fastblock_eligible(true, fresh, held, 101, -1, "main", kBits));
+        CHECK_FALSE(fastblock_eligible(true, fresh, held, 101, 0, "main", kBits));
     }
     SUBCASE("next block at a difficulty-retarget boundary -> skip (new bits unknown)") {
-        CHECK_FALSE(fastblock_eligible(true, false, fresh, held, 2016, 1, "main", kBits));
-        CHECK(fastblock_eligible(true, false, fresh, held, 2015, 1, "main", kBits));
-        CHECK(fastblock_eligible(true, false, fresh, held, 2017, 1, "main", kBits));
+        CHECK_FALSE(fastblock_eligible(true, fresh, held, 2016, 1, "main", kBits));
+        CHECK(fastblock_eligible(true, fresh, held, 2015, 1, "main", kBits));
+        CHECK(fastblock_eligible(true, fresh, held, 2017, 1, "main", kBits));
     }
     SUBCASE("testnet's 20-minute rule makes nBits timestamp-dependent at EVERY height -> skip") {
-        CHECK_FALSE(fastblock_eligible(true, false, fresh, held, 101, 1, "test", kBits));
-        CHECK_FALSE(fastblock_eligible(true, false, fresh, held, 101, 1, "testnet4", kBits));
+        CHECK_FALSE(fastblock_eligible(true, fresh, held, 101, 1, "test", kBits));
+        CHECK_FALSE(fastblock_eligible(true, fresh, held, 101, 1, "testnet4", kBits));
     }
 }
 

@@ -156,7 +156,7 @@
     },
     "coinbase_signature": {
       "type": "string",
-      "description": "Signature placed in the coinbase of solved blocks."
+      "description": "Signature placed in the coinbase of solved blocks. Must fit the 100-byte scriptSig alongside the height, extranonces, and 18-byte work identifier/framing budget (60 bytes with default extranonce sizes)."
     },
     "coinbase_version": {
       "type": "integer",
@@ -205,7 +205,7 @@
     },
     "stats_directory": {
       "type": "string",
-      "description": "Directory for pool/client stats files (pool.status, users/). Default 'stats'."
+      "description": "Persistent writable directory for work-generation, pool.status, users/, and recovered blocks. Startup fails if the work generation cannot be safely advanced. Default 'stats'."
     },
     "status_interval_seconds": {
       "type": "number",

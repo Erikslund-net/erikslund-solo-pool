@@ -208,6 +208,35 @@ TEST_CASE("pool.status round-trips through disk for restart recovery") {
     CHECK_FALSE(read_pool_status(dir.string()).has_value()); // absent -> nullopt
 }
 
+TEST_CASE("pool.status preserves fractional difficulty across repeated recovery") {
+    namespace fs = std::filesystem;
+    const fs::path directory = fs::temp_directory_path() / "ep_poolstatus_fractional_test";
+    fs::remove_all(directory);
+    constexpr double kAdditionalDifficulty = 0.125;
+    constexpr int kRecoveryCycles = 3;
+
+    for (const double initial_difficulty : {0.125, 13.875}) {
+        api::PoolSnapshot snapshot;
+        snapshot.uptime = 10;
+        snapshot.accepted_diff = initial_difficulty;
+        snapshot.best_share = initial_difficulty + 0.25;
+        const double best_share = snapshot.best_share;
+
+        for (int recovery = 0; recovery < kRecoveryCycles; ++recovery) {
+            const double expected_difficulty = initial_difficulty +
+                                               recovery * kAdditionalDifficulty;
+            write_pool_status(directory.string(), snapshot);
+            const auto recovered = read_pool_status(directory.string());
+            REQUIRE(recovered.has_value());
+            CHECK(recovered->accepted_diff == doctest::Approx(expected_difficulty));
+            CHECK(recovered->best_share == doctest::Approx(best_share));
+            snapshot.accepted_diff = recovered->accepted_diff + kAdditionalDifficulty;
+            snapshot.best_share = recovered->best_share;
+        }
+    }
+    fs::remove_all(directory);
+}
+
 TEST_CASE("blocks_found and per-address tallies persist across a restart") {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "ep_blocks_persist";

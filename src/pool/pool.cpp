@@ -32,8 +32,10 @@
 #include "core/errors.hpp"
 #include "core/logging.hpp"
 #include "core/version.hpp"
+#include "mining/work_identity.hpp"
 #include "stats/poolstatus.hpp"
 #include "sv2/session.hpp"
+#include "util/checked_counter.hpp"
 #include "util/endian.hpp"
 #include "util/hex.hpp"
 #include "util/sha256.hpp"
@@ -149,8 +151,9 @@ std::optional<Submission> wait_for_submission(std::deque<Submission>& queue, std
 }
 } // namespace
 
-Pool::Pool(Config config, bitcoin::WorkSource& source)
+Pool::Pool(Config config, bitcoin::WorkSource& source, uint64_t work_generation)
     : config_(std::move(config)),
+      work_generation_(work_generation),
       source_(source),
       runtime_config_(std::make_shared<const RuntimeConfig>(config_.runtime_config())),
       started_(static_cast<int64_t>(std::time(nullptr))), // wall: DISPLAYED/STORED
@@ -160,8 +163,9 @@ Pool::Pool(Config config, bitcoin::WorkSource& source)
                         started_steady_),
       sps_windows_(std::span<const int, stats::kSpsWindows.size()>(stats::kSpsWindows),
                    started_steady_) {
-    // Per-process random high half of job ids -> unique across restarts/replicas, non-sequential.
-    // XOR start time so a degenerate random_device still varies.
+    if (work_generation_ == 0)
+        throw std::invalid_argument("A reserved work generation is required");
+    // Job IDs are wire handles; the coinbase identifier separates actual mining work.
     job_id_prefix_ = static_cast<uint32_t>(std::random_device{}()) ^ static_cast<uint32_t>(started_);
     extranonce1_counter_.store(static_cast<uint64_t>(started_));
     // Empty-block witness commitment: witness merkle root is the all-zero coinbase wtxid, so
@@ -175,12 +179,44 @@ Pool::Pool(Config config, bitcoin::WorkSource& source)
 }
 
 Pool::~Pool() {
+    stop_workers();
+}
+
+void Pool::stop_workers() {
     submit_thread_.request_stop();
     recovery_thread_.request_stop();
     publication_thread_.request_stop();
     submit_cv_.notify_all();
     recovery_cv_.notify_all();
     publication_cv_.notify_all();
+    if (submit_thread_.joinable())
+        submit_thread_.join();
+    if (recovery_thread_.joinable())
+        recovery_thread_.join();
+    if (publication_thread_.joinable())
+        publication_thread_.join();
+}
+
+void Pool::shutdown() {
+    stop_workers();
+    // Workers have joined, so these queues are finite and final attempts cannot requeue.
+    const auto final_attempt = [this](const PendingBlock& block) {
+        if (submit_block(block))
+            log::warning("Block {} remains unconfirmed at shutdown; any spooled copy will be "
+                         "retried on startup", block.hash);
+    };
+    while (!submit_queue_.empty()) {
+        auto block = std::move(submit_queue_.front());
+        submit_queue_.pop_front();
+        final_attempt(*block);
+    }
+    while (!recovery_queue_.empty()) {
+        auto submission = std::move(recovery_queue_.front());
+        recovery_queue_.pop_front();
+        if (!submission.recovered_spool_path)
+            final_attempt(*submission.block);
+    }
+    write_stats();
 }
 
 void Pool::detect_network() {
@@ -240,12 +276,13 @@ void Pool::set_sv2_authenticated_state(
 }
 
 std::string Pool::next_job_id() {
-    return std::format("{:08x}{:08x}", job_id_prefix_, ++job_counter_);
+    return std::format("{:08x}{:08x}", job_id_prefix_, util::next_counter(job_counter_));
 }
 
 Bytes Pool::next_extranonce1() {
-    const uint64_t value = ++extranonce1_counter_;
     const size_t counter_size = config_.extranonce1_size - config_.extranonce1_prefix.size();
+    const uint64_t value = util::next_counter(extranonce1_counter_,
+                                             util::counter_maximum(counter_size));
     Bytes extranonce1 = config_.extranonce1_prefix;
     extranonce1.resize(config_.extranonce1_size, 0);
     for (size_t index = 0; index < counter_size; ++index)
@@ -258,9 +295,7 @@ Pool::PublishOutcome Pool::broadcast_job(const std::shared_ptr<const stratum::Jo
                                          bool require_new_prevhash) {
     {
         const std::unique_lock<std::shared_mutex> lock(jobs_mutex_);
-        // Suppress a broadcast byte-identical to the current job, atomically with publishing, so
-        // the GBT refresh and ZMQ fastblock can't race into re-issuing the same work (which would
-        // reset every miner to extranonce2=0).
+        // Decide atomically so racing GBT and ZMQ updates cannot rebroadcast unchanged templates.
         if (current_job_ && current_job_->work_signature() == job->work_signature())
             return PublishOutcome::Duplicate;
         // Height monotonicity, atomic with publication: never let a lower-height job replace a
@@ -275,6 +310,8 @@ Pool::PublishOutcome Pool::broadcast_job(const std::shared_ptr<const stratum::Jo
             return PublishOutcome::StalePrevhash;
         // Stamp publication order (atomic with the publish decision); sessions use it to drop a
         // notify already superseded by a newer publication.
+        if (publish_counter_ == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("Work publication counter exhausted");
         job->set_publication_sequence(++publish_counter_);
         current_job_ = job;
         recent_jobs_[job->job_id()] = job;
@@ -353,11 +390,16 @@ void Pool::publication_loop(const std::stop_token& stop) {
 }
 
 std::shared_ptr<stratum::Job> Pool::make_job(bitcoin::BlockTemplate block_template, bool clean) {
+    const uint64_t sequence = util::next_counter(job_counter_);
+    Bytes work_identifier;
+    work_identifier.reserve(mining::kWorkIdentifierSize);
+    util::append_le64(work_identifier, work_generation_);
+    util::append_le64(work_identifier, sequence);
     return std::make_shared<stratum::Job>(
-        next_job_id(), std::move(block_template),
+        std::format("{:08x}{:08x}", job_id_prefix_, sequence), std::move(block_template),
         Bytes(config_.coinbase_signature.begin(), config_.coinbase_signature.end()),
         config_.extranonce1_size, config_.extranonce2_size, config_.coinbase_version, clean,
-        donation_script_, config_.donation_percent);
+        donation_script_, config_.donation_percent, work_identifier);
 }
 
 void Pool::build_and_broadcast(bitcoin::BlockTemplate block_template, bool clean) {
@@ -394,7 +436,6 @@ void Pool::build_and_broadcast(bitcoin::BlockTemplate block_template, bool clean
         last_template_time_ = stats::steady_seconds(); // monotonic
         last_version_ = version;
         has_template_ = true;
-        fastblock_pending_ = false; // a fresh GBT supersedes the fastblock empty job
     }
     last_broadcast_steady_.store(stats::steady_seconds());
 
@@ -403,11 +444,11 @@ void Pool::build_and_broadcast(bitcoin::BlockTemplate block_template, bool clean
                    clean);
 }
 
-bool fastblock_eligible(bool has_template, bool fastblock_pending, const std::string& notified_tip,
+bool fastblock_eligible(bool has_template, const std::string& notified_tip,
                         const std::string& last_prevhash, int64_t next_height,
                         int64_t confirmations, const std::string& chain_name,
                         const std::string& bits_hex) {
-    if (!has_template || fastblock_pending)
+    if (!has_template)
         return false;
     // No nBits, no empty job: the fastblock template reuses the new tip's bits verbatim.
     if (bits_hex.empty())
@@ -436,12 +477,13 @@ uint64_t block_subsidy(int64_t height, int64_t halving_interval) {
 
 void Pool::on_zmq_block(const std::string& block_hash_display) {
     if (runtime_config_.load()->fast_block_notify && !block_hash_display.empty()) {
+        const auto current = current_job();
         // Cheap precheck (no RPC); the authoritative check repeats below. Gating testnet here
         // avoids a pointless header fetch per block where fastblock is permanently ineligible.
         bool maybe_eligible = false;
         {
             const std::scoped_lock lock(mutex_);
-            maybe_eligible = has_template_ && !fastblock_pending_ &&
+            maybe_eligible = has_template_ && current && !current->mines_on(block_hash_display) &&
                              block_hash_display != last_prevhash_ && chain_name_ != "test" &&
                              chain_name_ != "testnet4";
         }
@@ -462,47 +504,35 @@ void Pool::on_zmq_block(const std::string& block_hash_display) {
                 int64_t halving_interval = 210000;
                 {
                     const std::scoped_lock lock(mutex_);
-                    eligible = fastblock_eligible(has_template_, fastblock_pending_,
-                                                  block_hash_display, last_prevhash_, next_height,
+                    eligible = fastblock_eligible(has_template_, block_hash_display,
+                                                  last_prevhash_, next_height,
                                                   confirmations, chain_name_, bits_hex);
                     if (eligible) {
                         version = last_version_;
                         halving_interval = chain_name_ == "regtest" ? 150 : 210000;
-                        fastblock_pending_ = true;
                     }
                 }
                 if (eligible) {
-                    bool published = false;
-                    try {
-                        bitcoin::BlockTemplate block_template;
-                        block_template.height = next_height;
-                        block_template.version = version;
-                        block_template.curtime =
-                            std::max(static_cast<uint32_t>(std::time(nullptr)), mediantime + 1);
-                        block_template.bits_hex = bits_hex;
-                        block_template.bits = util::parse_hex_u32(bits_hex);
-                        block_template.coinbase_value = block_subsidy(next_height, halving_interval);
-                        block_template.previousblockhash = block_hash_display;
-                        block_template.coinbase_script_sig_prefix =
-                            bitcoin::serialize_height(next_height);
-                        block_template.coinbase_witness = Bytes(32, 0);
-                        block_template.coinbase_required_outputs.push_back(
-                            {0, util::from_hex(empty_commitment_)});
-                        const auto job = make_job(std::move(block_template), /*clean=*/true);
-                        const auto outcome =
-                            broadcast_job(job, /*clean=*/true, /*require_new_prevhash=*/true);
-                        published = outcome == PublishOutcome::Published;
-                        if (published) {
-                            last_broadcast_steady_.store(stats::steady_seconds());
-                            log::debug("Fastblock: empty work for height {} on new block {}",
-                                       next_height, block_hash_display);
-                        }
-                    } catch (const std::exception& e) {
-                        log::warning("Fastblock job build failed: {}", e.what());
-                    }
-                    if (!published) {
-                        const std::scoped_lock lock(mutex_);
-                        fastblock_pending_ = false;
+                    bitcoin::BlockTemplate block_template;
+                    block_template.height = next_height;
+                    block_template.version = version;
+                    block_template.curtime =
+                        std::max(static_cast<uint32_t>(std::time(nullptr)), mediantime + 1);
+                    block_template.bits_hex = bits_hex;
+                    block_template.bits = util::parse_hex_u32(bits_hex);
+                    block_template.coinbase_value = block_subsidy(next_height, halving_interval);
+                    block_template.previousblockhash = block_hash_display;
+                    block_template.coinbase_script_sig_prefix =
+                        bitcoin::serialize_height(next_height);
+                    block_template.coinbase_witness = Bytes(32, 0);
+                    block_template.coinbase_required_outputs.push_back(
+                        {0, util::from_hex(empty_commitment_)});
+                    const auto job = make_job(std::move(block_template), /*clean=*/true);
+                    if (broadcast_job(job, /*clean=*/true, /*require_new_prevhash=*/true) ==
+                        PublishOutcome::Published) {
+                        last_broadcast_steady_.store(stats::steady_seconds());
+                        log::debug("Fastblock: empty work for height {} on new block {}",
+                                   next_height, block_hash_display);
                     }
                 }
             } catch (const std::exception& e) {
@@ -817,7 +847,6 @@ void Pool::status_loop(const std::stop_token& stop) {
         if (!stop.stop_requested())
             source_.maybe_failback(tip);
     }
-    write_stats(); // final flush so a restart resumes from the latest stats
 }
 
 void Pool::recover_stats() {
@@ -916,7 +945,34 @@ void Pool::write_stats() {
 
 void Pool::spool_block(const PendingBlock& block) {
     try {
-        const std::filesystem::path dir = std::filesystem::path(config_.stats_directory) / "blocks";
+        const auto sync_descriptor = [](int descriptor) {
+            int result;
+            do {
+                result = ::fsync(descriptor);
+            } while (result < 0 && errno == EINTR);
+            return result < 0 ? errno : 0;
+        };
+        const auto sync_directory = [&sync_descriptor](const std::filesystem::path& path) {
+            int descriptor;
+            do {
+                descriptor = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            } while (descriptor < 0 && errno == EINTR);
+            if (descriptor < 0) {
+                const int error = errno;
+                throw std::system_error(error, std::generic_category(), "open " + path.string());
+            }
+
+            const int error = sync_descriptor(descriptor);
+            ::close(descriptor);
+            if (error != 0)
+                throw std::system_error(error, std::generic_category(), "fsync " + path.string());
+        };
+
+        const std::filesystem::path dir =
+            std::filesystem::absolute(std::filesystem::path(config_.stats_directory) / "blocks");
+        auto existing_directory = dir;
+        while (!std::filesystem::exists(existing_directory))
+            existing_directory = existing_directory.parent_path();
         std::filesystem::create_directories(dir);
         const std::filesystem::path path = dir / std::format("{}_{}.hex", block.height, block.hash);
         // Rename only complete files so recovery never reads a partial block.
@@ -933,12 +989,22 @@ void Pool::spool_block(const PendingBlock& block) {
             if (!out)
                 throw std::runtime_error("write " + temp_path.string() + ": " +
                                          std::generic_category().message(errno ? errno : EIO));
-        }
-        if (const int fd = ::open(temp_path.c_str(), O_RDONLY); fd >= 0) {
-            ::fsync(fd);
-            ::close(fd);
+            const int error = sync_descriptor(out.native_handle());
+            if (error != 0)
+                throw std::system_error(error, std::generic_category(),
+                                        "fsync " + temp_path.string());
+            out.close();
+            if (!out)
+                throw std::runtime_error("close " + temp_path.string() + ": " +
+                                         std::generic_category().message(errno ? errno : EIO));
         }
         std::filesystem::rename(temp_path, path);
+        // Persist the renamed file and every newly created directory entry.
+        for (auto directory = dir;; directory = directory.parent_path()) {
+            sync_directory(directory);
+            if (directory == existing_directory)
+                break;
+        }
         log::info("Spooled block to {} (address={} worker={}; recover with: bitcoin-cli "
                     "submitblock <contents>)",
                     path.string(), block.address, block.worker);
@@ -1006,7 +1072,7 @@ void Pool::resubmit_spooled_blocks() {
                 continue;
             try {
                 recovery_queue_.push_back(
-                    RecoveredSubmission{.block = std::move(block), .spool_path = path});
+                    DeferredSubmission{.block = std::move(block), .recovered_spool_path = path});
             } catch (...) {
                 tracked_recovered_blocks_.erase(tracked);
                 throw;
@@ -1205,7 +1271,7 @@ void Pool::on_block_found(const std::string& address, const std::string& worker,
         job.build_block_hex(result.legacy_coinbase, result.header), address, worker});
     {
         const std::scoped_lock lock(submit_mutex_);
-        submit_queue_.push_back(LiveSubmission{.block = block});
+        submit_queue_.push_back(block);
     }
     submit_cv_.notify_one(); // Queue submission before potentially blocking log and disk work.
     spool_block(*block);
@@ -1250,8 +1316,7 @@ bool Pool::submit_block(const PendingBlock& block) {
                           rejection.value_or("duplicate"));
             return false;
         case SubmitOutcome::Inconclusive:
-            log::warning("Block {} submission was inconclusive; retrying in {} seconds", block.hash,
-                         kInconclusiveRetryDelay.count());
+            log::warning("Block {} submission was inconclusive", block.hash);
             return true;
         case SubmitOutcome::Rejected:
             log::error("Block {} REJECTED by bitcoind: {}", block.hash,
@@ -1259,8 +1324,7 @@ bool Pool::submit_block(const PendingBlock& block) {
             return false;
         }
     } catch (const std::exception& e) {
-        log::error("submitblock failed: {} -- will retry in {} seconds", e.what(),
-                   kInconclusiveRetryDelay.count());
+        log::error("submitblock failed for {}: {}", block.hash, e.what());
     }
     return true;
 }
@@ -1352,17 +1416,27 @@ bool Pool::resolve_recovered_block_from_tip(const PendingBlock& block,
 }
 
 void Pool::submit_loop(const std::stop_token& stop) {
-    while (auto submission =
-               wait_for_submission(submit_queue_, submit_mutex_, submit_cv_, stop)) {
-        const bool retry = submit_block(*submission->block);
-        if (!retry || stop.stop_requested())
-            continue;
-        submission->retry_after = std::chrono::steady_clock::now() + kInconclusiveRetryDelay;
+    while (!stop.stop_requested()) {
+        std::shared_ptr<const PendingBlock> block;
         {
-            const std::scoped_lock lock(submit_mutex_);
-            submit_queue_.push_back(std::move(*submission));
+            std::unique_lock lock(submit_mutex_);
+            if (!submit_cv_.wait(lock, stop, [this] { return !submit_queue_.empty(); }) ||
+                stop.stop_requested())
+                return;
+            block = std::move(submit_queue_.front());
+            submit_queue_.pop_front();
         }
-        submit_cv_.notify_one();
+        const bool retry = submit_block(*block);
+        if (!retry)
+            continue;
+        {
+            const std::scoped_lock lock(recovery_mutex_);
+            recovery_queue_.push_back(DeferredSubmission{
+                .block = std::move(block),
+                .retry_after = std::chrono::steady_clock::now() + kInconclusiveRetryDelay,
+            });
+        }
+        recovery_cv_.notify_one();
     }
 }
 
@@ -1370,14 +1444,17 @@ void Pool::recovery_loop(const std::stop_token& stop) {
     while (auto submission =
                wait_for_submission(recovery_queue_, recovery_mutex_, recovery_cv_, stop)) {
         bool retry = false;
-        if (submission->submitted_once &&
-            resolve_recovered_block_from_tip(*submission->block, submission->spool_path)) {
+        if (!submission->recovered_spool_path) {
+            retry = submit_block(*submission->block);
+        } else if (submission->submitted_once &&
+                   resolve_recovered_block_from_tip(*submission->block,
+                                                    *submission->recovered_spool_path)) {
             retry = false;
         } else {
-            retry = submit_recovered_block(*submission->block, submission->spool_path);
+            retry = submit_recovered_block(*submission->block, *submission->recovered_spool_path);
             submission->submitted_once = true;
         }
-        if (!retry || stop.stop_requested())
+        if (!retry || (stop.stop_requested() && submission->recovered_spool_path))
             continue;
         submission->retry_after = std::chrono::steady_clock::now() + kInconclusiveRetryDelay;
         {

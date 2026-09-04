@@ -3,6 +3,7 @@
 // calls for HTTP keep-alive + DNS caching (an easy handle is not shared between threads).
 // Failover skips unreachable or temporarily unavailable nodes and sticks after a valid response.
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -15,6 +16,11 @@
 #include "bitcoin/rpc_endpoint.hpp"
 
 namespace erikslund::bitcoin {
+
+struct MiningTip {
+    std::string hash;
+    int64_t height;
+};
 
 class RpcClient {
 public:
@@ -34,6 +40,8 @@ public:
     std::string getbestblockhash();
     // Verbose header (height/bits/mediantime); grounds the fastblock empty job.
     glz::generic getblockheader(const std::string& block_hash);
+    // Check readiness and read the tip from one endpoint; the caller handles fallback.
+    MiningTip get_mining_tip();
 
     size_t endpoint_count() const { return endpoints_.size(); }
 
@@ -57,9 +65,12 @@ protected:
                                  long* http_status = nullptr);
 
 private:
+    std::string make_payload(const std::string& method,
+                             const glz::generic& params = glz::generic{});
     glz::generic call_payload(const std::string& payload, long timeout);
     std::string make_getblocktemplate_payload();
-    BlockTemplate fetch_template_from(size_t index, const std::string& payload);
+    BlockTemplate fetch_template_from(size_t index, const std::string& payload,
+                                      std::string& response_body);
 
     std::vector<Resolved> endpoints_;
     std::atomic<size_t> current_{0};
@@ -69,10 +80,9 @@ private:
     std::atomic<int> next_id_{0};
     std::atomic<double> last_failback_probe_{-std::numeric_limits<double>::infinity()};
     mutable std::mutex failback_mutex_;
-    std::optional<std::string> failback_expected_tip_;
+    std::optional<BlockTemplate> failback_template_;
 
-    // Pool::refresh_work is the sole fetch_template caller, so this buffer can be reused across
-    // polls.
+    // Only work refresh uses this buffer; failback probes keep their own response.
     std::string gbt_body_;
 };
 

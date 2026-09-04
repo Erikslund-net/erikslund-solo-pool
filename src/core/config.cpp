@@ -20,6 +20,7 @@
 #include "bitcoin/coinbase.hpp"
 #include "core/errors.hpp"
 #include "core/logging.hpp"
+#include "mining/work_identity.hpp"
 #include "util/hex.hpp"
 
 namespace erikslund {
@@ -159,8 +160,7 @@ void finalize_and_validate(Config& config) {
         throw ConfigError("work_source: ipc requires a non-empty ipc_socket_path");
     if (config.poll_interval <= 0.0)
         throw ConfigError("block_poll_milliseconds must be >= 1");
-    // Min 4: extranonce1 is a bare wrapping counter; a 2-byte space can lap under churn and
-    // hand two concurrent miners identical search space. 4 bytes cannot lap.
+    // Reserve enough session IDs for sustained connection churn.
     if (config.extranonce1_size < 4 || config.extranonce1_size > 8)
         throw ConfigError("extranonce1_size must be in [4, 8]");
     if (config.extranonce1_prefix.size() > config.extranonce1_size - 4)
@@ -187,11 +187,11 @@ void finalize_and_validate(Config& config) {
 
     const size_t scriptsig_budget =
         bitcoin::kMaxHeightPush + config.extranonce1_size + config.extranonce2_size +
-        config.coinbase_signature.size();
+        config.coinbase_signature.size() + mining::kWorkIdentifierScriptBudget;
     if (scriptsig_budget > bitcoin::kMaxScriptSig)
         throw ConfigError("coinbase_signature too long: it must leave room in the " +
                           std::to_string(bitcoin::kMaxScriptSig) +
-                          "-byte coinbase scriptSig for the height push and extranonces");
+                          "-byte coinbase scriptSig for the height, extranonces, and work identifier");
 }
 
 std::vector<std::string> to_list(const ScalarOrList& value) {

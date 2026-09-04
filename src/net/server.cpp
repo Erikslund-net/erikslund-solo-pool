@@ -552,6 +552,8 @@ void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
                     size_t newline;
                     while ((newline = connection->buffer.find('\n', start)) != std::string::npos) {
                         std::string_view line(connection->buffer.data() + start, newline - start);
+                        if (line.size() > max_line_bytes_)
+                            break;
                         start = newline + 1;
                         if (!line.empty() && line.back() == '\r')
                             line.remove_suffix(1);

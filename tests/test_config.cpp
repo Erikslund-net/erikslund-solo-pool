@@ -227,14 +227,14 @@ TEST_CASE("maximum_difficulty cannot be below minimum_difficulty") {
 }
 
 TEST_CASE("an over-long coinbase_signature is rejected at load") {
-    // Budget 10 + 4 + 8 + tag <= 100, so the default extranonces leave the tag 78 bytes.
+    // The default extranonces and work identifier/framing leave 60 bytes for the signature.
     CHECK_THROWS_AS(
-        Config::from_string(std::string(R"({"coinbase_signature": ")") + std::string(79, 'x') +
+        Config::from_string(std::string(R"({"coinbase_signature": ")") + std::string(61, 'x') +
                             R"("})"),
         ConfigError);
-    CHECK(Config::from_string(std::string(R"({"coinbase_signature": ")") + std::string(78, 'x') +
+    CHECK(Config::from_string(std::string(R"({"coinbase_signature": ")") + std::string(60, 'x') +
                               R"("})")
-              .coinbase_signature.size() == 78);
+              .coinbase_signature.size() == 60);
 }
 
 TEST_CASE("work_source selects IPC without a separate acknowledgement") {
@@ -444,17 +444,16 @@ TEST_CASE("max_line_bytes must be positive") {
 }
 
 TEST_CASE("the scriptSig budget tracks the extranonce sizes, not just the signature length") {
-    // height_push(10) + en1 + en2 + sig must stay <= 100. With en1=8, en2=8, a 75-byte
-    // tag = 10+8+8+75 = 101 -> rejected; 74 -> 100 exactly -> accepted.
+    // Height(10) + extranonces(16) + identifier/framing(18) leaves 56 bytes.
     CHECK_THROWS_AS(
         Config::from_string(std::string(R"({"extranonce1_size": 8, "extranonce2_size": 8, )"
                                         R"("coinbase_signature": ")") +
-                            std::string(75, 'x') + R"("})"),
+                            std::string(57, 'x') + R"("})"),
         ConfigError);
     CHECK_NOTHROW(
         Config::from_string(std::string(R"({"extranonce1_size": 8, "extranonce2_size": 8, )"
                                         R"("coinbase_signature": ")") +
-                            std::string(74, 'x') + R"("})"));
+                            std::string(56, 'x') + R"("})"));
 }
 
 TEST_CASE("rpc_endpoints lists the primary first, then failover in order") {

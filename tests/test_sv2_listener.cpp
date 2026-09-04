@@ -26,6 +26,7 @@
 #include "core/config.hpp"
 #include "net/server.hpp"
 #include "pool/pool.hpp"
+#include "work_generation_fixture.hpp"
 #include "sv2/messages.hpp"
 #include "sv2_noise_test_oracle.hpp"
 #include "sv2/session.hpp"
@@ -346,7 +347,7 @@ TEST_CASE("SV2 leaves one quarter of the client limit available to SV1") {
     config.auth_timeout_seconds = 0;
 
     UnusedWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     net::Server server(pool, config);
     server.start();
     const uint16_t sv1_port = server.bound_port(net::WireProtocol::Sv1);
@@ -410,7 +411,7 @@ TEST_CASE("incomplete SV2 Noise handshakes are capped") {
     config.auth_timeout_seconds = 0;
 
     UnusedWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     net::Server server(pool, config);
     server.start();
     const uint16_t port = server.bound_port(net::WireProtocol::Sv2Noise);
@@ -471,7 +472,7 @@ TEST_CASE("expired SV2 credentials leave the SV1 listener available") {
     config.worker_threads = 1;
 
     UnusedWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     net::Server server(pool, config);
     CHECK_NOTHROW(server.start());
     CHECK(server.bound_port(net::WireProtocol::Sv1) != 0);
@@ -502,7 +503,7 @@ TEST_CASE("unsupported SV2 certificate versions do not export an untrusted expir
     config.worker_threads = 1;
 
     UnusedWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     net::Server server(pool, config);
     CHECK_NOTHROW(server.start());
     CHECK(server.bound_port(net::WireProtocol::Sv1) != 0);
@@ -535,7 +536,7 @@ TEST_CASE("short and oversized SV2 static-secret files disable only authenticate
         config.worker_threads = 1;
 
         UnusedWorkSource source;
-        Pool pool(config, source);
+        Pool pool(config, source, test::kWorkGeneration);
         net::Server server(pool, config);
         CHECK_NOTHROW(server.start());
         CHECK(server.bound_port(net::WireProtocol::Sv1) != 0);
@@ -579,7 +580,7 @@ TEST_CASE("a failed plaintext SV2 bind rolls back the optional group and leaves 
     config.worker_threads = 1;
 
     UnusedWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     net::Server server(pool, config);
     CHECK_NOTHROW(server.start());
     CHECK(server.bound_port(net::WireProtocol::Sv1) != 0);
@@ -606,7 +607,7 @@ TEST_CASE("authenticated SV2 listener completes Noise before protocol dispatch")
     config.auth_timeout_seconds = 0;
 
     UnusedWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     net::Server server(pool, config);
     server.start();
     const uint16_t port = server.bound_port(net::WireProtocol::Sv2Noise);
@@ -686,7 +687,7 @@ TEST_CASE("SV2 listener preserves final frames after the reactor fairness yield"
     config.auth_timeout_seconds = 0;
 
     UnusedWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     net::Server server(pool, config);
     server.start();
     const uint16_t port = server.bound_port(net::WireProtocol::Sv2Plaintext);
@@ -763,7 +764,7 @@ TEST_CASE("SV2 listener keeps the connection alive after closing an Extended Cha
     config.auth_timeout_seconds = 0;
 
     SeededWorkSource source;
-    Pool pool(config, source);
+    Pool pool(config, source, test::kWorkGeneration);
     pool.detect_network();
     std::jthread refresh_thread(
         [&](const std::stop_token& stop) { pool.refresh_work(stop); });
