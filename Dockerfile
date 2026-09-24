@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Glaze (stephenberry/glaze): the header-only JSON/YAML library used by the pool. Drop the
 # include tree onto the default search path (/usr/local/include); header-only, so no link step and
 # the runtime image carries nothing from it.
-ARG GLAZE_VERSION=v8.3.0
+ARG GLAZE_VERSION=v8.4.0
 RUN git clone --depth 1 --branch "${GLAZE_VERSION}" https://github.com/stephenberry/glaze.git /tmp/glaze \
     && cp -r /tmp/glaze/include/glaze /usr/local/include/glaze \
     && rm -rf /tmp/glaze
@@ -61,7 +61,7 @@ RUN git clone --depth 1 --branch "${ERIKSLUND_HTTP_VERSION}" \
 # mimalloc (Microsoft): the allocator interposed for the share path's many small concurrent
 # allocations. Built from a pinned release (like Glaze) instead of the distro package -- installs
 # libmimalloc.so + mimalloc.h to /usr/local (MI_INSTALL_TOPLEVEL) for find_library/<mimalloc.h>.
-ARG MIMALLOC_VERSION=v3.5.1
+ARG MIMALLOC_VERSION=v3.5.3
 RUN git clone --depth 1 --branch "${MIMALLOC_VERSION}" https://github.com/microsoft/mimalloc.git /tmp/mimalloc \
     && cmake -S /tmp/mimalloc -B /tmp/mimalloc/build -DCMAKE_BUILD_TYPE=Release \
         -DMI_INSTALL_TOPLEVEL=ON -DMI_BUILD_TESTS=OFF \
