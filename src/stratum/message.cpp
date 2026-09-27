@@ -31,6 +31,8 @@ namespace {
 // (legit Stratum messages are flat).
 constexpr int kMaxJsonDepth = 64;
 
+constexpr glz::opts kRequestReadOptions{.null_terminated = false};
+
 bool within_depth(std::string_view text) {
     int depth = 0;
     bool in_string = false, escaped = false;
@@ -79,7 +81,7 @@ std::optional<Request> parse_request(std::string_view line) {
     // Fast path
     {
         message_detail::RequestWire wire;
-        if (!glz::read_json(wire, line)) {
+        if (!glz::read<kRequestReadOptions>(wire, line)) {
             if (!wire.method)
                 return std::nullopt; // missing or null method: the DOM path rejects these too
             // configure/suggest_difficulty carry non-flat params the typed shape can't represent
@@ -100,7 +102,7 @@ std::optional<Request> parse_request(std::string_view line) {
 
 std::optional<Request> detail::parse_request_dom(std::string_view line) {
     json doc;
-    if (glz::read_json(doc, line))   // parse error
+    if (glz::read<kRequestReadOptions>(doc, line))   // parse error
         return std::nullopt;
     if (!doc.is_object())
         return std::nullopt;

@@ -319,6 +319,22 @@ initial_difficulty: "1024"
     std::filesystem::remove(bad_path);
 }
 
+TEST_CASE("YAML plain-scalar quotes do not affect credentials on later lines") {
+    for (const std::string_view newline : {"\n", "\r\n"}) {
+        std::string text;
+        for (const char* line : {"bitcoin_nodes:",
+                                 "  - address: http://node:8332",
+                                 "    username: don't",
+                                 "    password: 'rpc: secret'"}) {
+            text += line;
+            text += newline;
+        }
+        const Config config = Config::from_string(text);
+        CHECK(config.rpc_user == "don't");
+        CHECK(config.rpc_password == "rpc: secret");
+    }
+}
+
 TEST_CASE("from_file still reads a JSON config (YAML is a JSON superset)") {
     const auto path = write_temp("ep_config_test.json", R"({
         "bitcoin_nodes": [{"address": "http://node:8332"}],

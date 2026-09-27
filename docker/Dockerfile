@@ -30,7 +30,7 @@ RUN apt-get update && apt-get dist-upgrade -y && apt-get install -y --no-install
 # Glaze (header-only: JSON/YAML/CBOR/... serialization + compile-time reflection): the JSON
 # parser/serializer the pool builds against. Header-only -> drop the include tree onto the
 # default search path (/usr/local/include); no link step.
-ARG GLAZE_VERSION=v8.4.0
+ARG GLAZE_VERSION=v9.0.0
 RUN git clone --depth 1 --branch "${GLAZE_VERSION}" https://github.com/stephenberry/glaze.git /tmp/glaze \
     && cp -r /tmp/glaze/include/glaze /usr/local/include/glaze \
     && rm -rf /tmp/glaze

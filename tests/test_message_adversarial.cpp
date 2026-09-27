@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <string>
+#include <string_view>
 
 #include "stratum/message.hpp"
 
@@ -29,6 +30,51 @@ TEST_CASE("parse_request rejects truncated / unbalanced JSON without throwing") 
     CHECK_FALSE(parse_request(R"({"method":"mining.subscribe",})").has_value()); // trailing comma
     CHECK_FALSE(parse_request(R"({"method":"a","params":[1,2,)").has_value());   // array cut off
     CHECK_FALSE(parse_request(R"({"id":1,"method":"a","params":[}})").has_value());
+}
+
+TEST_CASE("request parsers reject empty exponents but accept signed exponents") {
+    for (const auto parse : {parse_request, detail::parse_request_dom}) {
+        for (const char* number : {"1e", "1e+", "1e-", "1E", "1E+", "1E-"}) {
+            CAPTURE(number);
+            CHECK_FALSE(parse(std::string(R"({"id":)") + number +
+                              R"(,"method":"mining.subscribe"})").has_value());
+            CHECK_FALSE(parse(std::string(R"({"method":"mining.suggest_difficulty","params":[)") +
+                              number + "]}").has_value());
+        }
+        for (const char* number : {"1e2", "1e+2", "10000e-2", "1E2", "1E+2", "10000E-2"}) {
+            CAPTURE(number);
+            const auto request = parse(std::string(R"({"id":)") + number +
+                                       R"(,"method":"mining.subscribe"})");
+            REQUIRE(request.has_value());
+            REQUIRE(request->id.is_number());
+            CHECK(request->id.get<double>() == doctest::Approx(100.0));
+
+            const auto suggestion = parse(
+                std::string(R"({"method":"mining.suggest_difficulty","params":[)") +
+                number + "]}");
+            REQUIRE(suggestion.has_value());
+            REQUIRE(suggestion->suggested_difficulty.has_value());
+            CHECK(*suggestion->suggested_difficulty == doctest::Approx(100.0));
+        }
+    }
+}
+
+TEST_CASE("request parsers respect string_view boundaries at every truncation") {
+    const std::string line =
+        R"({"id":"request","method":"mining.submit","params":["rig\"name","job"]})";
+    const std::string backing = line + "trailing bytes outside the view";
+    const std::string_view view(backing.data(), line.size());
+    for (const auto parse : {parse_request, detail::parse_request_dom}) {
+        const auto request = parse(view);
+        REQUIRE(request.has_value());
+        CHECK(request->method == "mining.submit");
+        REQUIRE(request->params.size() == 2);
+        CHECK(request->params[0] == "rig\"name");
+        for (size_t length = 0; length < view.size(); ++length) {
+            CAPTURE(length);
+            CHECK_FALSE(parse(view.substr(0, length)).has_value());
+        }
+    }
 }
 
 TEST_CASE("parse_request rejects bare / garbage / control-character text") {

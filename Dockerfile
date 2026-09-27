@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Glaze (stephenberry/glaze): the header-only JSON/YAML library used by the pool. Drop the
 # include tree onto the default search path (/usr/local/include); header-only, so no link step and
 # the runtime image carries nothing from it.
-ARG GLAZE_VERSION=v8.4.0
+ARG GLAZE_VERSION=v9.0.0
 RUN git clone --depth 1 --branch "${GLAZE_VERSION}" https://github.com/stephenberry/glaze.git /tmp/glaze \
     && cp -r /tmp/glaze/include/glaze /usr/local/include/glaze \
     && rm -rf /tmp/glaze
