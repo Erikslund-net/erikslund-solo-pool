@@ -63,7 +63,9 @@ Session::Session(stratum::PoolContext& pool, Connection& connection, Bytes extra
       connection_(connection),
       decoder_(maximum_payload_size),
       extranonce1_(std::move(extranonce1)),
-      version_mask_(pool.version_mask() == kBip320VersionMask ? kBip320VersionMask : 0),
+      // SV2 has no mask negotiation, so an operator-narrowed SV1 mask means fixed-version SV2 work.
+      version_mask_(pool.version_mask() == kBip320VersionMask ? stratum::kSv2VersionRollingMask
+                                                              : 0),
       connected_at_(static_cast<int64_t>(std::time(nullptr))),
       connected_at_steady_(stats::steady_seconds()),
       hashrate_(std::span<const int, stats::kHashrateWindows.size()>(stats::kHashrateWindows),

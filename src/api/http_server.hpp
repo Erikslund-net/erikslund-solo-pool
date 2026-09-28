@@ -15,6 +15,9 @@ class Pool;
 
 namespace erikslund::api {
 
+inline constexpr unsigned kMaxConnections = 32;
+inline constexpr unsigned kWorkerThreads = 1;
+
 class HttpServer {
 public:
     HttpServer(Pool& pool, std::string host, uint16_t port);

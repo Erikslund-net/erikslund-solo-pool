@@ -13,6 +13,15 @@ services:
     user: "1000:1000"
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     read_only: true
     tmpfs: ["/tmp"]
     extra_hosts:

@@ -22,7 +22,6 @@ namespace {
 constexpr std::string_view kAddressCharacters =
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._";
 constexpr size_t kMaximumAddressBytes = 127;
-constexpr unsigned kHttpWorkerThreads = 1;
 
 namespace http = erikslund::http;
 
@@ -123,7 +122,8 @@ namespace http = erikslund::http;
 
     http::ServerOptions options;
     options.listeners.push_back(std::move(listener));
-    options.worker_threads = kHttpWorkerThreads;
+    options.worker_threads = kWorkerThreads;
+    options.max_connections = kMaxConnections;
     options.limits.max_body_bytes = 0;
     options.reuse_port = false;
     options.log = pool_log_sink();

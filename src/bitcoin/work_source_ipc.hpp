@@ -25,6 +25,9 @@ public:
     HeaderFacts fetch_header(const std::string& block_hash) override {
         return rpc_.fetch_header(block_hash);
     }
+    BlockStanding block_standing(const std::string& block_hash) override {
+        return rpc_.block_standing(block_hash);
+    }
     std::optional<std::string> submit_block_hex(const std::string& block_hex) override {
         return rpc_.submit_block_hex(block_hex);
     }

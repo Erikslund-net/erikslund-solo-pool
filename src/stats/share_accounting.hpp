@@ -35,6 +35,8 @@ public:
                  double now_steady, double age_seconds);
 
 private:
+    friend struct WorkerAccountingTestPeek;
+
     mutable std::mutex mutex_;
     DecayingWindows<kHashrateWindows.size()> hashrate_;
     uint64_t shares_accepted_ = 0;

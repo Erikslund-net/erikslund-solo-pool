@@ -40,6 +40,8 @@ public:
     std::string getbestblockhash();
     // Verbose header (height/bits/mediantime); grounds the fastblock empty job.
     glz::generic getblockheader(const std::string& block_hash);
+    // Every branch tip the node knows, with its validation status.
+    glz::generic getchaintips();
     // Check readiness and read the tip from one endpoint; the caller handles fallback.
     MiningTip get_mining_tip();
 

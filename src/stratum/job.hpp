@@ -75,6 +75,10 @@ struct ShareInput {
     int64_t now_unix = 0;
 };
 
+// Version bits an SV2 device may roll whenever version rolling is allowed: BIP323's
+// general-purpose bits, which the SV2 Mining Protocol references. SV1 negotiates its own mask.
+inline constexpr uint32_t kSv2VersionRollingMask = 0x1fffffe0;
+
 struct StandardWork {
     Bytes legacy_coinbase;
     util::Hash256 merkle_root{};
@@ -92,7 +96,7 @@ struct StandardShareInput {
     uint32_t ntime = 0;
     uint32_t nonce = 0;
     uint32_t version = 0;
-    uint32_t version_mask = 0x1fffe000;
+    uint32_t version_mask = kSv2VersionRollingMask;
     util::uint256 share_target;
     int64_t now_unix = 0;
 };
@@ -104,7 +108,7 @@ struct ExtendedShareInput {
     uint32_t ntime = 0;
     uint32_t nonce = 0;
     uint32_t version = 0;
-    uint32_t version_mask = 0x1fffe000;
+    uint32_t version_mask = kSv2VersionRollingMask;
     util::uint256 share_target;
     int64_t now_unix = 0;
 };

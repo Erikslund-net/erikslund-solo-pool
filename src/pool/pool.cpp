@@ -292,7 +292,8 @@ Bytes Pool::next_extranonce1() {
 }
 
 Pool::PublishOutcome Pool::broadcast_job(const std::shared_ptr<const stratum::Job>& job, bool clean,
-                                         bool require_new_prevhash) {
+                                         bool require_new_prevhash,
+                                         const stratum::Job* replaceable) {
     {
         const std::unique_lock<std::shared_mutex> lock(jobs_mutex_);
         // Decide atomically so racing GBT and ZMQ updates cannot rebroadcast unchanged templates.
@@ -301,7 +302,9 @@ Pool::PublishOutcome Pool::broadcast_job(const std::shared_ptr<const stratum::Jo
         // Height monotonicity, atomic with publication: never let a lower-height job replace a
         // higher one. build_and_broadcast pre-checks this unlocked, so a concurrent fastblock can
         // publish a higher job in the gap; this re-check stops the lagging GBT yanking miners back.
-        if (current_job_ && job->height() < current_job_->height())
+        // Only the job whose parent the node abandoned may be replaced by lower work.
+        if (current_job_ && job->height() < current_job_->height() &&
+            current_job_.get() != replaceable)
             return PublishOutcome::StaleHeight;
         // Fastblock-only: if a concurrent GBT already published a full job for this tip, replacing
         // it with empty work would throw the fees away. Atomic with publication closes the race.
@@ -402,16 +405,59 @@ std::shared_ptr<stratum::Job> Pool::make_job(bitcoin::BlockTemplate block_templa
         donation_script_, config_.donation_percent, work_identifier);
 }
 
+bool Pool::parent_abandoned(const stratum::Job& job) {
+    try {
+        return source_.block_standing(util::to_hex_reversed(job.prevhash_internal())) ==
+               bitcoin::BlockStanding::Abandoned;
+    } catch (const std::exception& error) {
+        static log::RateLimit standing_log;
+        log::message_limited(log::Level::Warning, standing_log,
+                             "Could not check whether bitcoind abandoned the current work's "
+                             "parent: {}",
+                             error.what());
+        return false;
+    }
+}
+
+void Pool::note_refused_template(const std::string& previousblockhash) {
+    {
+        const std::scoped_lock lock(mutex_);
+        refused_tip_ = previousblockhash;
+    }
+    const double now = stats::steady_seconds();
+    double accepted = 0.0;
+    templates_refused_since_.compare_exchange_strong(accepted, now, std::memory_order_relaxed);
+    // Pace the next refetch of an unchanged tip to the rebroadcast interval.
+    last_broadcast_steady_.store(now);
+}
+
+bool Pool::templates_stalled(double now_steady) const {
+    const double since = templates_refused_since_.load(std::memory_order_relaxed);
+    return since > 0.0 &&
+           now_steady - since > 2.0 * runtime_config_.load()->work_rebroadcast_seconds;
+}
+
 void Pool::build_and_broadcast(bitcoin::BlockTemplate block_template, bool clean) {
-    // Height monotonicity: a template BELOW the current job's height comes from a lagging node;
-    // broadcasting it would yank miners onto an orphan-doomed parent. Honest recovery always
-    // arrives at an equal-or-greater height, so skipping strictly-lower templates can't pin miners.
+    static log::RateLimit refused_template_log;
+    // Height monotonicity: a template BELOW the current job's height usually comes from a lagging
+    // node, and broadcasting it would yank miners onto an orphan-doomed parent. It replaces the
+    // current work only when the node abandoned that work's parent (invalidateblock, or a reorg
+    // onto a lower-height chain); a node still catching up leaves the current work in place.
+    std::shared_ptr<const stratum::Job> abandoned;
     if (const auto current = current_job();
         current && block_template.height < current->height()) {
-        log::warning("Ignoring a GBT at height {} below the current job's height {} "
-                     "(lagging bitcoind?); keeping the current work",
-                     block_template.height, current->height());
-        return;
+        if (!parent_abandoned(*current)) {
+            note_refused_template(block_template.previousblockhash);
+            log::message_limited(log::Level::Warning, refused_template_log,
+                                 "Ignoring a GBT at height {} below the current job's height {} "
+                                 "(lagging bitcoind?); keeping the current work",
+                                 block_template.height, current->height());
+            return;
+        }
+        log::warning("bitcoind abandoned the parent of the height {} work (reorg or "
+                     "invalidateblock); following its chain back to height {}",
+                     current->height(), block_template.height);
+        abandoned = current;
     }
 
     // Copy what the bookkeeping/logs below need BEFORE the move: make_job pilfers the template's
@@ -423,11 +469,14 @@ void Pool::build_and_broadcast(bitcoin::BlockTemplate block_template, bool clean
 
     const auto job = make_job(std::move(block_template), clean);
 
-    const PublishOutcome outcome = broadcast_job(job, clean);
+    const PublishOutcome outcome =
+        broadcast_job(job, clean, /*require_new_prevhash=*/false, abandoned.get());
     if (outcome == PublishOutcome::StaleHeight) {
-        log::warning("Ignoring a GBT at height {} below the current job's height (lagging "
-                     "bitcoind?); keeping the current work",
-                     height);
+        note_refused_template(prevhash);
+        log::message_limited(log::Level::Warning, refused_template_log,
+                             "Ignoring a GBT at height {} below the current job's height (lagging "
+                             "bitcoind?); keeping the current work",
+                             height);
         return;
     }
     {
@@ -436,7 +485,9 @@ void Pool::build_and_broadcast(bitcoin::BlockTemplate block_template, bool clean
         last_template_time_ = stats::steady_seconds(); // monotonic
         last_version_ = version;
         has_template_ = true;
+        refused_tip_.clear();
     }
+    templates_refused_since_.store(0.0, std::memory_order_relaxed);
     last_broadcast_steady_.store(stats::steady_seconds());
 
     if (outcome == PublishOutcome::Published)
@@ -476,6 +527,7 @@ uint64_t block_subsidy(int64_t height, int64_t halving_interval) {
 }
 
 void Pool::on_zmq_block(const std::string& block_hash_display) {
+    notify_new_block();
     if (runtime_config_.load()->fast_block_notify && !block_hash_display.empty()) {
         const auto current = current_job();
         // Cheap precheck (no RPC); the authoritative check repeats below. Gating testnet here
@@ -540,6 +592,7 @@ void Pool::on_zmq_block(const std::string& block_hash_display) {
             }
         }
     }
+    // The early tip probe may have run before fastblock published its new parent.
     notify_new_block();
 }
 
@@ -565,12 +618,10 @@ void Pool::refresh_work(const std::stop_token& stop) {
             if (!fetch) {
                 const std::string tip = source_.get_tip();
                 set_generator_ready(true);
-                if (!job->mines_on(tip)) {
-                    fetch = true;
-                } else {
-                    const std::scoped_lock lock(mutex_);
-                    fetch = tip != last_prevhash_;
-                }
+                const std::scoped_lock lock(mutex_);
+                // A tip whose template was refused as lower than the current work is refetched
+                // only when a rebroadcast is due, not every poll.
+                fetch = (!job->mines_on(tip) || tip != last_prevhash_) && tip != refused_tip_;
             }
             if (fetch) {
                 auto block_template = source_.fetch_template();
@@ -610,7 +661,11 @@ Pool::add_client(std::shared_ptr<stratum::Connection> connection) {
             std::make_shared<ConnectedClient>(
                 ConnectedClient{std::move(connection), session, false}));
     }
-    log::info("Client connected: {} (extranonce1={})", peer, session->extranonce1_hex());
+    static log::RateLimit connection_log_limit{log::kOperationalMessageInterval,
+                                              log::kOperationalMessageBurst};
+    log::message_limited(log::Level::Info, connection_log_limit,
+                         "Client connected: {} (extranonce1={})", peer,
+                         session->extranonce1_hex());
     return session;
 }
 
@@ -627,7 +682,10 @@ Pool::add_sv2_client(std::shared_ptr<sv2::Connection> connection) {
             std::make_shared<ConnectedClient>(
                 ConnectedClient{std::move(connection), session, true}));
     }
-    log::debug("SV2 client connected: {}", peer);
+    static log::RateLimit connection_log_limit{log::kOperationalMessageInterval,
+                                              log::kOperationalMessageBurst};
+    log::message_limited(log::Level::Debug, connection_log_limit,
+                         "SV2 client connected: {}", peer);
     return session;
 }
 
@@ -767,36 +825,44 @@ void Pool::prune_user_stats(int64_t now) {
     const int64_t ghost_cutoff = now - kGhostRowGraceSeconds;
     const int64_t retention_cutoff =
         retention_on ? now - static_cast<int64_t>(retention_days) * 86400 : 0;
-    const std::scoped_lock lock(user_stats_mutex_);
-    for (auto addr_it = user_stats_.begin(); addr_it != user_stats_.end();) {
-        auto& workers = addr_it->second;
-        for (auto it = workers.begin(); it != workers.end();) {
-            const auto& accounting = it->second;
-            const bool pinned = accounting.use_count() > 1;
-            bool expired = false;
-            const auto [last_activity, last_share] = accounting->activity();
-            if (!pinned && last_activity > 0) {
-                if (last_share == 0)
-                    expired = last_activity < ghost_cutoff; // never mined
-                else if (retention_on)
-                    expired = last_activity < retention_cutoff; // mined, retention on
-                // else: mined + keep-forever -> never expired
+    std::vector<std::string> expired_addresses;
+    {
+        const std::scoped_lock lock(user_stats_mutex_);
+        for (auto addr_it = user_stats_.begin(); addr_it != user_stats_.end();) {
+            auto& workers = addr_it->second;
+            for (auto it = workers.begin(); it != workers.end();) {
+                const auto& accounting = it->second;
+                if (accounting.use_count() > 1) {
+                    ++it;
+                    continue;
+                }
+                bool expired = false;
+                const auto [last_activity, last_share] = accounting->activity();
+                if (last_activity > 0) {
+                    if (last_share == 0)
+                        expired = last_activity < ghost_cutoff; // never mined
+                    else if (retention_on)
+                        expired = last_activity < retention_cutoff; // mined, retention on
+                    // else: mined + keep-forever -> never expired
+                }
+                if (expired)
+                    it = workers.erase(it);
+                else
+                    ++it;
             }
-            if (expired)
-                it = workers.erase(it);
-            else
-                ++it;
+            if (workers.empty()) {
+                expired_addresses.push_back(addr_it->first);
+                addr_it = user_stats_.erase(addr_it);
+            } else {
+                ++addr_it;
+            }
         }
-        if (workers.empty()) {
-            // No rows left: delete the address file NOW so a restart between registry-prune and
-            // file-prune can't resurrect the evicted rows.
-            std::error_code ec;
-            std::filesystem::remove(
-                std::filesystem::path(config_.stats_directory) / "users" / addr_it->first, ec);
-            addr_it = user_stats_.erase(addr_it);
-        } else {
-            ++addr_it;
-        }
+    }
+    // Finish deletion before the next stats snapshot, without blocking authorizations on disk I/O.
+    const auto users_directory = std::filesystem::path(config_.stats_directory) / "users";
+    for (const auto& address : expired_addresses) {
+        std::error_code ec;
+        std::filesystem::remove(users_directory / address, ec);
     }
 }
 
@@ -1145,7 +1211,8 @@ api::PoolSnapshot Pool::snapshot(bool include_workers) const {
         total_share_difficulty_.load(std::memory_order_relaxed);
 
     snapshot.stratifier_ready = job != nullptr;
-    snapshot.ready = snapshot.generator_ready && snapshot.connector_ready && job != nullptr;
+    snapshot.ready = snapshot.generator_ready && snapshot.connector_ready && job != nullptr &&
+                     !templates_stalled(now_steady);
     if (job) {
         snapshot.height = job->height();
         snapshot.current_job = job->job_id();
@@ -1221,21 +1288,32 @@ api::PoolSnapshot Pool::snapshot(bool include_workers) const {
     // Sample the persistent registry into snapshot.workers ONLY for the stats-file writer; the HTTP
     // path skips this O(registry) walk and its per-worker rate locks.
     if (include_workers) {
-        const std::scoped_lock lock(user_stats_mutex_);
-        for (const auto& [address, workers] : user_stats_)
-            for (const auto& [worker, accounting] : workers) {
-                const auto worker_stats = accounting->snapshot(now_steady);
-                api::WorkerSnapshot ws;
-                ws.address = address;
-                ws.worker = worker;
-                ws.connected = connected_accounting.contains(accounting);
-                ws.shares_accepted = worker_stats.shares_accepted;
-                ws.shares_rejected = worker_stats.shares_rejected;
-                ws.best_difficulty = worker_stats.best_difficulty;
-                ws.last_share_ts = worker_stats.last_share_ts;
-                ws.hashrate_windows = worker_stats.hashrate_windows;
-                snapshot.workers.push_back(std::move(ws));
-            }
+        struct WorkerEntry {
+            std::string address;
+            std::string worker;
+            stats::WorkerAccountingHandle accounting;
+        };
+        std::vector<WorkerEntry> worker_entries;
+        {
+            const std::scoped_lock lock(user_stats_mutex_);
+            for (const auto& [address, workers] : user_stats_)
+                for (const auto& [worker, accounting] : workers)
+                    worker_entries.push_back({address, worker, accounting});
+        }
+        snapshot.workers.reserve(worker_entries.size());
+        for (auto& entry : worker_entries) {
+            const auto worker_stats = entry.accounting->snapshot(now_steady);
+            api::WorkerSnapshot worker_snapshot;
+            worker_snapshot.address = std::move(entry.address);
+            worker_snapshot.worker = std::move(entry.worker);
+            worker_snapshot.connected = connected_accounting.contains(entry.accounting);
+            worker_snapshot.shares_accepted = worker_stats.shares_accepted;
+            worker_snapshot.shares_rejected = worker_stats.shares_rejected;
+            worker_snapshot.best_difficulty = worker_stats.best_difficulty;
+            worker_snapshot.last_share_ts = worker_stats.last_share_ts;
+            worker_snapshot.hashrate_windows = worker_stats.hashrate_windows;
+            snapshot.workers.push_back(std::move(worker_snapshot));
+        }
     }
 
     snapshot.connected = active_workers;
@@ -1259,7 +1337,8 @@ api::PoolSnapshot Pool::snapshot(bool include_workers) const {
 }
 
 bool Pool::ready() const {
-    return generator_ready_.load() && connector_ready_.load() && current_job() != nullptr;
+    return generator_ready_.load() && connector_ready_.load() && current_job() != nullptr &&
+           !templates_stalled(stats::steady_seconds());
 }
 
 void Pool::on_block_found(const std::string& address, const std::string& worker,

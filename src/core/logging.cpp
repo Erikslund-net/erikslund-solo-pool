@@ -44,6 +44,33 @@ Level level() {
     return g_level.load(std::memory_order_relaxed);
 }
 
+std::optional<uint64_t> RateLimit::admit(std::chrono::steady_clock::time_point now) {
+    const std::scoped_lock lock(mutex_);
+    if (interval_ <= std::chrono::seconds::zero())
+        return std::exchange(suppressed_, 0);
+    if (!last_refill_)
+        last_refill_ = now;
+    else if (now > *last_refill_) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - *last_refill_);
+        const auto refill = elapsed / interval_;
+        if (refill >= burst_ - tokens_) {
+            tokens_ = burst_;
+            // Discard credit beyond capacity so quiet categories cannot bank an unbounded burst.
+            last_refill_ = now;
+        } else if (refill > 0) {
+            const auto added = static_cast<unsigned>(refill);
+            tokens_ += added;
+            *last_refill_ += interval_ * added;
+        }
+    }
+    if (tokens_ == 0) {
+        ++suppressed_;
+        return std::nullopt;
+    }
+    --tokens_;
+    return std::exchange(suppressed_, 0);
+}
+
 bool set_log_file(std::string_view path) {
     const std::scoped_lock lock(g_write_mutex);
     if (g_log_file) {

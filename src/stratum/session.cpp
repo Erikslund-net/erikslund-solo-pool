@@ -24,6 +24,13 @@ namespace erikslund::stratum {
 using json = glz::generic;
 
 namespace {
+constexpr std::chrono::seconds kControlLogInterval{1};
+log::RateLimit control_warning_limit{kControlLogInterval};
+log::RateLimit authorization_log_limit{log::kOperationalMessageInterval,
+                                      log::kOperationalMessageBurst};
+log::RateLimit difficulty_log_limit{log::kOperationalMessageInterval,
+                                   log::kOperationalMessageBurst};
+
 // Append `value` lowercased (no padding). For length-meaningful fields (job_id, and extranonce2
 // which goes raw into the coinbase, so "ab" != "00ab") a short value must NOT collapse onto a
 // valid full-width one.
@@ -243,11 +250,33 @@ void Session::handle_line(std::string_view line) {
     if (!request)
         return;
     if (request->method == "mining.submit") [[likely]] {
+        // Preserve shares already read before a control request marked the session for closing.
         handle_submit(request->id, request->params);
         return;
     }
     const std::scoped_lock lock(mutex_);
+    if (!allow_control_request(std::chrono::steady_clock::now()))
+        return;
     dispatch(*request);
+}
+
+bool Session::allow_control_request(std::chrono::steady_clock::time_point now) {
+    if (should_close())
+        return false;
+    if (now > control_refill_at_) {
+        const double elapsed = std::chrono::duration<double>(now - control_refill_at_).count();
+        control_request_tokens_ = std::min(kControlRequestBurst,
+            control_request_tokens_ + elapsed * kControlRequestsPerSecond);
+        control_refill_at_ = now;
+    }
+    if (control_request_tokens_ < 1.0) {
+        close_requested_.store(true, std::memory_order_relaxed);
+        log::message_limited(log::Level::Warning, control_warning_limit,
+                             "Closing {}: excessive Stratum control requests", connection_.peer());
+        return false;
+    }
+    control_request_tokens_ -= 1.0;
+    return true;
 }
 
 void Session::dispatch(const Request& request) {
@@ -397,14 +426,18 @@ void Session::handle_authorize(const json& id, const std::vector<std::string>& p
     // address_/payout_script_.
     auto script = pool_.validate_address(address);
     if (!script) {
-        log::warning("Rejecting worker {}: invalid payout address '{}'", connection_.peer(),
-                     address); // already sanitized at ingress
+        ++protocol_errors_;
+        log::message_limited(log::Level::Warning, control_warning_limit,
+                             "Rejecting worker {}: invalid payout address '{}'", connection_.peer(),
+                             address); // already sanitized at ingress
         send_result(id, false);
         return;
     }
     if (authorized_ && payout_script_ && *payout_script_ != *script) {
-        log::warning("Refusing re-authorize on {}: payout address {} -> {} on one connection",
-                     connection_.peer(), or_empty(address_), address); // sanitized at ingress
+        ++protocol_errors_;
+        log::message_limited(log::Level::Warning, control_warning_limit,
+                             "Refusing re-authorize on {}: payout address {} -> {} on one connection",
+                             connection_.peer(), or_empty(address_), address); // sanitized at ingress
         send_result(id, false);
         return;
     }
@@ -429,8 +462,9 @@ void Session::handle_authorize(const json& id, const std::vector<std::string>& p
                 begin_difficulty_change(*clamped);
                 shares_since_retarget_ = 0;
                 last_retarget_ = stats::steady_seconds();
-                log::info("Password difficulty {} -> {}", connection_.peer(),
-                          util::format_difficulty(*clamped));
+                log::message_limited(log::Level::Info, difficulty_log_limit,
+                                     "Password difficulty {} -> {}", connection_.peer(),
+                                     util::format_difficulty(*clamped));
             }
         }
     }
@@ -439,8 +473,9 @@ void Session::handle_authorize(const json& id, const std::vector<std::string>& p
     // before its first share.
     worker_accounting_ = pool_.attach_worker(*address_, *worker_);
     send_result(id, true);
-    log::info("Authorized {} (address={}, user_agent={}, extranonce1={})", connection_.peer(),
-              *address_, user_agent_, extranonce1_hex()); // both sanitized at ingress
+    log::message_limited(log::Level::Info, authorization_log_limit,
+                         "Authorized {} (address={}, user_agent={}, extranonce1={})", connection_.peer(),
+                         *address_, user_agent_, extranonce1_hex()); // both sanitized at ingress
 
     send_difficulty_then_work();
 }
@@ -458,8 +493,9 @@ void Session::handle_suggest_difficulty(const Request& request) {
             last_retarget_ = stats::steady_seconds();
             if (subscribed_)
                 do_send_set_difficulty();
-            log::info("Suggest-difficulty {} -> {}", connection_.peer(),
-                      util::format_difficulty(*clamped));
+            log::message_limited(log::Level::Info, difficulty_log_limit,
+                                 "Suggest-difficulty {} -> {}", connection_.peer(),
+                                 util::format_difficulty(*clamped));
         }
     }
     send_result(request.id, true);

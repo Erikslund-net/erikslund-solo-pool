@@ -62,8 +62,8 @@ zmq_block_endpoint: tcp://bitcoind:28332
 
 IPC templates are accepted only when their parent and height match the RPC node's
 tip. On mainnet, that node must also be synced and connected to peers. If RPC
-permissions are restricted, allow `getblockchaininfo` and `getconnectioncount`
-alongside the pool's other RPC methods. Readiness or validation failures use RPC
+permissions are restricted, allow `getblockchaininfo`, `getconnectioncount`, and
+`getchaintips` alongside the pool's other RPC methods. Readiness or validation failures use RPC
 `getblocktemplate` fallback; IPC is retried automatically.
 
 ### Reloading configuration

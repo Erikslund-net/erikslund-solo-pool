@@ -71,8 +71,8 @@ void ZmqSubscriber::run(const std::stop_token& stop) {
                 reinterpret_cast<const uint8_t*>(hash_bytes.data()), hash_bytes.size()));
         frame = 0;
         hash_bytes.clear();
-        log::info("ZMQ: new-block notification {}", hash_hex);
         pool_.on_zmq_block(hash_hex);
+        log::info("ZMQ: new-block notification {}", hash_hex);
     }
 
     zmq_close(socket);

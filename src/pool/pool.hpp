@@ -80,9 +80,8 @@ public:
     void reload_config(const RuntimeConfig& config);
     void note_config_reload_rejected() noexcept;
 
-    // include_workers samples the persistent per-worker registry into snapshot.workers (an
-    // O(registry) walk under user_stats_mutex_). Only the stats-file writer passes true; the HTTP
-    // path leaves it false to avoid that cost and per-worker snapshot locking.
+    // include_workers copies registry handles under its lock, then samples rows outside it.
+    // Only the stats-file writer includes workers; HTTP skips the persistent registry.
     api::PoolSnapshot snapshot(bool include_workers = false) const;
     // Cheap readiness probe for /health (same predicate as PoolSnapshot::ready).
     bool ready() const;
@@ -160,8 +159,14 @@ private:
     void build_and_broadcast(bitcoin::BlockTemplate block_template, bool clean);
     std::shared_ptr<stratum::Job> make_job(bitcoin::BlockTemplate block_template, bool clean);
     enum class PublishOutcome { Published, Duplicate, StaleHeight, StalePrevhash };
+    // `replaceable` is the one higher job a lower-height job may replace: a job whose parent the
+    // node abandoned. Any other higher job stays current.
     PublishOutcome broadcast_job(const std::shared_ptr<const stratum::Job>& job, bool clean,
-                                 bool require_new_prevhash = false);
+                                 bool require_new_prevhash = false,
+                                 const stratum::Job* replaceable = nullptr);
+    bool parent_abandoned(const stratum::Job& job);
+    void note_refused_template(const std::string& previousblockhash);
+    bool templates_stalled(double now_steady) const;
     void enqueue_publication(
         const std::shared_ptr<ConnectedClient>& recipient,
         const std::shared_ptr<const stratum::Job>& job, bool clean);
@@ -194,6 +199,11 @@ private:
     std::map<std::string, uint64_t> blocks_by_address_; // guarded by mutex_ (not jobs_mutex_)
     std::set<std::string> credited_blocks_;             // block hashes already counted (mutex_)
     std::string last_prevhash_;                         // guarded by mutex_ (not jobs_mutex_)
+    // Parent of the last template refused as lower than the current work (mutex_). Until the tip
+    // moves, it is refetched only at the rebroadcast interval.
+    std::string refused_tip_;
+    // steady_seconds() when node templates started being refused; 0 while they are accepted.
+    std::atomic<double> templates_refused_since_{0.0};
 
     std::atomic<uint64_t> job_counter_{0};
     uint32_t job_id_prefix_ = 0;

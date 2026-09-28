@@ -795,7 +795,7 @@ TEST_CASE("SV2 retargets every open Extended Channel") {
 
 TEST_CASE("SV2 replenishes work for a high-hash Standard Channel") {
     constexpr float kHashRateRequiringFrequentRefresh =
-        500'000'000'000'000.0F;
+        100'000'000'000'000'000.0F;
     const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
     FakePool pool(now);
     FakeConnection connection;
@@ -835,7 +835,7 @@ TEST_CASE("SV2 immediately replaces work when an update enables rapid refresh") 
     const auto initial_job = sv2::decode_new_mining_job(initial[1].payload);
 
     session.handle_bytes(sv2::encode_message(sv2::UpdateChannel{
-        opened.channel_id, 500'000'000'000'000.0F, maximum_target()}));
+        opened.channel_id, 100'000'000'000'000'000.0F, maximum_target()}));
     const auto updated = connection.take_frames();
     REQUIRE(updated.size() == 2);
     CHECK(updated[0].message_type == sv2::SetExtranoncePrefix::kMessageType);
@@ -844,7 +844,7 @@ TEST_CASE("SV2 immediately replaces work when an update enables rapid refresh") 
           initial_job.merkle_root);
 
     session.handle_bytes(sv2::encode_message(sv2::UpdateChannel{
-        opened.channel_id, 500'000'000'000'000.0F, maximum_target()}));
+        opened.channel_id, 100'000'000'000'000'000.0F, maximum_target()}));
     CHECK(connection.take_frames().empty());
 }
 
@@ -1081,6 +1081,59 @@ TEST_CASE("SV2 hands off a block once and rejects its duplicate") {
           "duplicate-share");
     CHECK(pool.accepted == 1);
     CHECK(pool.rejected == 1);
+    CHECK(pool.blocks == 1);
+}
+
+TEST_CASE("SV2 accepts a block that rolls BIP323 general-purpose version bits") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now);
+    pool.job = make_job(now, "207fffff");
+    pool.initial_difficulty = 2.5;
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+
+    setup(session);
+    connection.take_frames();
+    open_channel(session);
+    const auto initial = connection.take_frames();
+    REQUIRE(initial.size() == 3);
+    const auto opened =
+        sv2::decode_open_standard_mining_channel_success(initial[0].payload);
+    const auto announced = sv2::decode_new_mining_job(initial[1].payload);
+    const stratum::StandardWork work =
+        pool.job->build_standard_work(kPayoutScript, opened.extranonce_prefix);
+    const util::uint256 target = util::uint256::from_le_bytes(opened.target);
+
+    // Bit 5 is general purpose under BIP323 but outside BIP320's 0x1fffe000.
+    const uint32_t rolled_version = pool.job->version() ^ 0x00000020U;
+    std::optional<uint32_t> winning_nonce;
+    for (uint32_t nonce = 0; nonce < 1'000; ++nonce) {
+        const auto result = pool.job->validate_standard_share(
+            {work.legacy_coinbase, work.merkle_root, pool.job->curtime(), nonce, rolled_version,
+             stratum::kSv2VersionRollingMask, target, static_cast<int64_t>(std::time(nullptr))});
+        if (result && result->is_block) {
+            winning_nonce = nonce;
+            break;
+        }
+    }
+    REQUIRE(winning_nonce.has_value());
+
+    session.handle_bytes(sv2::encode_message(sv2::SubmitSharesStandard{
+        opened.channel_id, 3, announced.job_id, *winning_nonce, pool.job->curtime(),
+        rolled_version}));
+    auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    CHECK(frames[0].message_type == sv2::SubmitSharesSuccess::kMessageType);
+    CHECK(pool.blocks == 1);
+
+    // Bits outside BIP323's general-purpose range stay fixed.
+    session.handle_bytes(sv2::encode_message(sv2::SubmitSharesStandard{
+        opened.channel_id, 4, announced.job_id, *winning_nonce, pool.job->curtime(),
+        pool.job->version() ^ 0x00000001U}));
+    frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].message_type == sv2::SubmitSharesError::kMessageType);
+    CHECK(sv2::decode_submit_shares_error(frames[0].payload).error_code == "invalid-share");
     CHECK(pool.blocks == 1);
 }
 

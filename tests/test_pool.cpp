@@ -304,6 +304,63 @@ public:
     }
 };
 
+// Serves templates on a settable chain and reports a settable standing for the block the pool asks
+// about, so tests can tell a node that abandoned the current parent from one still catching up.
+class RollbackWorkSource final : public bitcoin::WorkSource {
+public:
+    std::atomic<bitcoin::BlockStanding> standing{bitcoin::BlockStanding::Pending};
+    std::atomic<size_t> template_fetches{0};
+    std::atomic<size_t> standing_checks{0};
+
+    void set_chain(char parent, int64_t height) {
+        const std::scoped_lock lock(mutex_);
+        parent_ = parent;
+        height_ = height;
+    }
+
+    std::string checked_block() {
+        const std::scoped_lock lock(mutex_);
+        return checked_block_;
+    }
+
+    bitcoin::ChainInfo detect_chain() override { return {.chain = "regtest", .blocks = 170}; }
+
+    std::string get_tip() override {
+        const std::scoped_lock lock(mutex_);
+        return std::string(64, parent_);
+    }
+
+    bitcoin::BlockTemplate fetch_template() override {
+        template_fetches.fetch_add(1, std::memory_order_relaxed);
+        auto result = refresh_template();
+        const std::scoped_lock lock(mutex_);
+        result.height = height_;
+        result.previousblockhash = std::string(64, parent_);
+        return result;
+    }
+
+    bitcoin::HeaderFacts fetch_header(const std::string&) override { return {}; }
+
+    bitcoin::BlockStanding block_standing(const std::string& block_hash) override {
+        {
+            const std::scoped_lock lock(mutex_);
+            checked_block_ = block_hash;
+        }
+        standing_checks.fetch_add(1, std::memory_order_relaxed);
+        return standing.load();
+    }
+
+    std::optional<std::string> submit_block_hex(const std::string&) override {
+        return std::nullopt;
+    }
+
+private:
+    std::mutex mutex_;
+    char parent_ = 'b';
+    int64_t height_ = 171;
+    std::string checked_block_;
+};
+
 constexpr int64_t kRecoveredBlockHeight = 500;
 constexpr std::chrono::seconds kSynchronizationTimeout{5};
 constexpr std::string_view kRecoveredBlockHeaderHex =
@@ -313,6 +370,49 @@ constexpr std::string_view kRecoveredBlockHeaderHex =
     "29ab5f49"
     "ffff001d"
     "1dac2b7c";
+
+class BlockingFastblockHeaderSource final : public bitcoin::WorkSource {
+public:
+    std::atomic<char> tip{'a'};
+    std::atomic<size_t> tip_probes{0};
+    bool fail_header = false;
+    std::promise<void> header_entered;
+    const std::shared_future<void> header_started = header_entered.get_future().share();
+    std::binary_semaphore continue_header{0};
+
+    bitcoin::ChainInfo detect_chain() override { return {.chain = "regtest", .blocks = 169}; }
+
+    std::string get_tip() override {
+        const char current_tip = tip.load();
+        tip_probes.fetch_add(1, std::memory_order_relaxed);
+        // Hold the early probe until fastblock enters its header lookup.
+        if (current_tip == 'b' &&
+            header_started.wait_for(kSynchronizationTimeout) != std::future_status::ready)
+            throw RpcConnectionError("header lookup did not start");
+        return std::string(64, current_tip);
+    }
+
+    bitcoin::BlockTemplate fetch_template() override {
+        const char current_tip = tip.load();
+        auto result = refresh_template();
+        result.height += current_tip - 'a';
+        result.previousblockhash = std::string(64, current_tip);
+        return result;
+    }
+
+    bitcoin::HeaderFacts fetch_header(const std::string&) override {
+        header_entered.set_value();
+        continue_header.acquire();
+        if (fail_header)
+            throw RpcConnectionError("header lookup failed");
+        return {.height = 170, .confirmations = 1,
+                .bits_hex = "1d00ffff", .mediantime = 1700000000};
+    }
+
+    std::optional<std::string> submit_block_hex(const std::string&) override {
+        return std::nullopt;
+    }
+};
 
 struct RecoveredBlockFixture {
     std::filesystem::path stats_directory;
@@ -698,6 +798,100 @@ TEST_CASE("fastblock follows successive tips during a template outage and recove
     CHECK(source.header_fetches == 2);
 }
 
+TEST_CASE("ZMQ wakes template refresh before a blocked fastblock header lookup finishes") {
+    Config config;
+    config.poll_interval = 3600;
+    config.work_rebroadcast_seconds = 3600;
+    BlockingFastblockHeaderSource source;
+    SUBCASE("header lookup succeeds") {}
+    SUBCASE("header lookup fails") { source.fail_header = true; }
+    Pool pool(config, source, test::kWorkGeneration);
+    std::jthread worker([&pool](const std::stop_token& stop) { pool.refresh_work(stop); });
+    REQUIRE(wait_until([&] { return pool.current_job() != nullptr; }));
+    pool.notify_new_block();
+    REQUIRE(wait_until([&] { return source.tip_probes.load() != 0; }));
+
+    source.tip.store('b');
+    std::jthread notification([&] { pool.on_zmq_block(std::string(64, 'b')); });
+    const bool header_blocked =
+        source.header_started.wait_for(kSynchronizationTimeout) == std::future_status::ready;
+    const bool refreshed_while_blocked = header_blocked && wait_until([&] {
+        return pool.current_job()->mines_on(std::string(64, 'b'));
+    });
+    const auto full_job = pool.current_job();
+
+    source.continue_header.release();
+    notification.join();
+    worker.request_stop();
+    worker.join();
+
+    CHECK(header_blocked);
+    REQUIRE(refreshed_while_blocked);
+    CHECK(pool.current_job() == full_job);
+    CHECK(full_job->height() == 171);
+}
+
+TEST_CASE("a lower template replaces the current work once bitcoind abandoned its parent") {
+    Config config;
+    config.poll_interval = 0.001;
+    config.work_rebroadcast_seconds = 3600;
+    RollbackWorkSource source;
+    Pool pool(config, source, test::kWorkGeneration);
+    pool.set_connector_ready(true);
+    std::jthread worker([&pool](const std::stop_token& stop) { pool.refresh_work(stop); });
+    REQUIRE(wait_until([&] {
+        const auto job = pool.current_job();
+        return job && job->height() == 171;
+    }));
+
+    // invalidateblock on the current parent: the node now builds at 170 on 'a'.
+    source.standing.store(bitcoin::BlockStanding::Abandoned);
+    source.set_chain('a', 170);
+    REQUIRE(wait_until([&] { return pool.current_job()->mines_on(std::string(64, 'a')); }));
+    CHECK(pool.current_job()->height() == 170);
+    CHECK(source.checked_block() == std::string(64, 'b'));
+    CHECK(pool.ready());
+}
+
+TEST_CASE("a lower template from a lagging bitcoind keeps the work, paces refetches, and "
+          "reports the stall") {
+    Config config;
+    config.poll_interval = 0.001;
+    config.work_rebroadcast_seconds = 1;
+    RollbackWorkSource source;
+    Pool pool(config, source, test::kWorkGeneration);
+    pool.set_connector_ready(true);
+    std::jthread worker([&pool](const std::stop_token& stop) { pool.refresh_work(stop); });
+    REQUIRE(wait_until([&] {
+        const auto job = pool.current_job();
+        return job && job->height() == 171;
+    }));
+    REQUIRE(pool.ready());
+
+    // The node reports a lower tip but has not abandoned 'b' (standing stays Pending).
+    source.set_chain('a', 170);
+    REQUIRE(wait_until([&] { return source.standing_checks.load() != 0; }));
+    const size_t fetches_at_refusal = source.template_fetches.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // One template per rebroadcast interval, not one per 1 ms poll.
+    CHECK(source.template_fetches.load() - fetches_at_refusal <= 1);
+    CHECK(pool.current_job()->mines_on(std::string(64, 'b')));
+    CHECK(pool.ready());
+
+    // Refused for longer than two rebroadcast intervals: readiness reports the stall.
+    const auto deadline = std::chrono::steady_clock::now() + kSynchronizationTimeout;
+    while (pool.ready() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK_FALSE(pool.ready());
+    CHECK_FALSE(pool.snapshot().ready);
+    CHECK(pool.current_job()->mines_on(std::string(64, 'b')));
+
+    // The node catches up past the current work.
+    source.set_chain('c', 172);
+    REQUIRE(wait_until([&] { return pool.current_job()->mines_on(std::string(64, 'c')); }));
+    CHECK(pool.ready());
+}
+
 TEST_CASE("refresh_work logs one warning and one recovery per outage") {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "ep-refresh-log-test";
@@ -836,6 +1030,14 @@ std::vector<api::WorkerSnapshot> workers_of(const api::PoolSnapshot& s, const st
 }
 const char* kAddr = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
 } // namespace
+
+namespace erikslund::stats {
+struct WorkerAccountingTestPeek {
+    static std::unique_lock<std::mutex> lock_row(WorkerAccounting& accounting) {
+        return std::unique_lock(accounting.mutex_);
+    }
+};
+} // namespace erikslund::stats
 
 namespace erikslund {
 struct PoolTestPeek {
@@ -1898,6 +2100,60 @@ TEST_CASE("duplicate-inconclusive is retryable and is never credited") {
     CHECK(pool.snapshot().blocks_by_address.empty());
 }
 
+TEST_CASE("worker snapshots do not block unrelated authorization") {
+    Config config;
+    bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
+    bitcoin::RpcWorkSource rpc_source(rpc);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
+    auto accounting = pool.attach_worker(kAddr, "blocked");
+    REQUIRE(accounting);
+
+    std::future<api::PoolSnapshot> sampling;
+    std::future<stats::WorkerAccountingHandle> attaching;
+    auto row_lock = stats::WorkerAccountingTestPeek::lock_row(*accounting);
+    sampling = std::async(std::launch::async, [&] { return pool.snapshot(true); });
+    const bool copied_row = wait_until([&] { return accounting.use_count() > 2; });
+    attaching = std::async(std::launch::async,
+                           [&] { return pool.attach_worker(kAddr, "new-worker"); });
+    const bool attached_while_blocked =
+        attaching.wait_for(kSynchronizationTimeout) == std::future_status::ready;
+    const bool snapshot_waited =
+        sampling.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+    row_lock.unlock();
+    const auto attached = attaching.get();
+    const auto snapshot = sampling.get();
+
+    CHECK(copied_row);
+    CHECK(attached_while_blocked);
+    CHECK(snapshot_waited);
+    REQUIRE(attached);
+    const auto rows = workers_of(snapshot, kAddr);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front().worker == "blocked");
+    CHECK(workers_of(pool.snapshot(true), kAddr).size() == 2);
+}
+
+TEST_CASE("pruning does not wait on a pinned worker accounting mutex") {
+    Config config;
+    bitcoin::RpcClient rpc("http://127.0.0.1:1", "user", "pass");
+    bitcoin::RpcWorkSource rpc_source(rpc);
+    Pool pool(config, rpc_source, test::kWorkGeneration);
+    auto accounting = pool.attach_worker(kAddr, "blocked");
+    REQUIRE(accounting);
+    const int64_t much_later = static_cast<int64_t>(std::time(nullptr)) + 10 * 86400;
+
+    std::future<void> pruning;
+    auto row_lock = stats::WorkerAccountingTestPeek::lock_row(*accounting);
+    pruning = std::async(std::launch::async, [&] { PoolTestPeek::prune(pool, much_later); });
+    const bool pruned_while_blocked =
+        pruning.wait_for(kSynchronizationTimeout) == std::future_status::ready;
+    row_lock.unlock();
+    pruning.get();
+
+    CHECK(pruned_while_blocked);
+    CHECK(workers_of(pool.snapshot(true), kAddr).size() == 1);
+}
+
 TEST_CASE("prune keeps a held worker row and evicts it once the last handle is gone") {
     namespace fs = std::filesystem;
     const fs::path stats = fs::temp_directory_path() / "ep_prune_pin_test";
@@ -1911,17 +2167,23 @@ TEST_CASE("prune keeps a held worker row and evicts it once the last handle is g
     auto accounting = pool.attach_worker(kAddr, "w1"); // an authorized Session holds this handle
     REQUIRE(accounting);
     REQUIRE(workers_of(pool.snapshot(true), kAddr).size() == 1);
+    fs::create_directories(stats / "users");
+    const auto user_file = stats / "users" / kAddr;
+    std::ofstream(user_file) << "old stats\n";
+    REQUIRE(fs::exists(user_file));
 
     const int64_t much_later = static_cast<int64_t>(std::time(nullptr)) + 10 * 86400;
 
     // Held (a live session still owns the row): never evicted, however stale the clock says it is.
     PoolTestPeek::prune(pool, much_later);
     CHECK(workers_of(pool.snapshot(true), kAddr).size() == 1);
+    CHECK(fs::exists(user_file));
 
     // Handle released (session gone): the map is the sole owner, so the stale row is evicted.
     accounting.reset();
     PoolTestPeek::prune(pool, much_later);
     CHECK(workers_of(pool.snapshot(true), kAddr).empty());
+    CHECK_FALSE(fs::exists(user_file));
 
     fs::remove_all(stats);
 }

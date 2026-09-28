@@ -13,8 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include <sys/resource.h>
-
 #include "api/http_server.hpp"
 #include "bitcoin/capnp_mining_client.hpp"
 #include "bitcoin/rpc_client.hpp"
@@ -24,6 +22,7 @@
 #include "core/crash.hpp"
 #include "core/errors.hpp"
 #include "core/logging.hpp"
+#include "core/resource_limits.hpp"
 #include "core/version.hpp"
 #include "mining/work_identity.hpp"
 #include "net/server.hpp"
@@ -54,15 +53,6 @@ void apply_api_overrides(erikslund::Config& config,
         config.api_host = *host;
     if (port)
         config.api_port = *port;
-}
-
-void clamp_max_clients(erikslund::Config& config, long open_file_limit) {
-    if (open_file_limit < 0 || config.max_clients <= open_file_limit)
-        return;
-    erikslund::log::warning("max_clients ({}) exceeds the open file limit ({}); lowering to {} "
-                            "-- raise it (ulimit -n / LimitNOFILE) to allow more",
-                            config.max_clients, open_file_limit, open_file_limit);
-    config.max_clients = static_cast<int>(open_file_limit);
 }
 
 std::string join_names(const std::vector<std::string>& names) {
@@ -125,13 +115,13 @@ int main(int argc, char** argv) {
 
     log::info("erikslund-solo-pool v{} starting -- stratum {}:{}, bitcoind {}", kVersion,
                 config.bind_host, config.bind_port, util::redact_url(config.rpc_url));
-    long open_file_limit = -1; // -1 means unlimited / unavailable
-    if (rlimit nofile{}; ::getrlimit(RLIMIT_NOFILE, &nofile) == 0 && nofile.rlim_cur != RLIM_INFINITY)
-        open_file_limit = static_cast<long>(nofile.rlim_cur);
-    clamp_max_clients(config, open_file_limit);
-    const std::string open_file_limit_text =
-        open_file_limit < 0 ? std::string("unlimited") : std::to_string(open_file_limit);
-    log::info("Max clients: {} (open file limit of {})", config.max_clients, open_file_limit_text);
+    const unsigned worker_count = net::resolve_worker_count(config.worker_threads);
+    try {
+        core::apply_file_budget(config, worker_count, !log_file.empty());
+    } catch (const std::exception& error) {
+        log::error("Cannot reserve file descriptors: {}", error.what());
+        return 1;
+    }
 #ifdef HAVE_MIMALLOC
     const int mimalloc_version = mi_version();
     const bool mi_v3 = mimalloc_version >= 10000;
@@ -203,7 +193,9 @@ int main(int argc, char** argv) {
     pool.recover_user_stats();      // resume per-worker stats (hashrates decayed by file age)
     pool.resubmit_spooled_blocks(); // re-submit any block a previous run couldn't confirm
 
-    net::Server server(pool, config);
+    Config server_config = config;
+    server_config.worker_threads = static_cast<int>(worker_count);
+    net::Server server(pool, server_config);
     try {
         server.start();
     } catch (const std::exception& e) {
@@ -226,7 +218,8 @@ int main(int argc, char** argv) {
     const std::stop_callback interrupt_work(stop.get_token(), [source] { source->interrupt(); });
     // The signal handler only sets flags; parsing and applying configuration happens here.
     std::jthread watcher([&stop, &pool, &server, config_path, api_host_override,
-                          api_port_override, open_file_limit, active_config = config]() mutable {
+                          api_port_override, worker_count, file_log = !log_file.empty(),
+                          active_config = config]() mutable {
         while (!g_shutdown.load(std::memory_order_relaxed) && !stop.stop_requested()) {
             if (g_reload_requested.exchange(false, std::memory_order_relaxed)) {
                 if (config_path.empty()) {
@@ -236,7 +229,6 @@ int main(int argc, char** argv) {
                     try {
                         Config replacement = Config::from_file(config_path);
                         apply_api_overrides(replacement, api_host_override, api_port_override);
-                        clamp_max_clients(replacement, open_file_limit);
                         const auto restart_required =
                             active_config.restart_required_changes(replacement);
                         if (!restart_required.empty()) {
@@ -244,6 +236,7 @@ int main(int argc, char** argv) {
                             log::warning("Config reload rejected; restart required for: {}",
                                          join_names(restart_required));
                         } else {
+                            core::apply_file_budget(replacement, worker_count, file_log);
                             const RuntimeConfig runtime_config = replacement.runtime_config();
                             pool.reload_config(runtime_config);
                             server.reload_config(runtime_config);

@@ -6,10 +6,14 @@
 
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "api/http_server.hpp"
 #include "bitcoin/rpc_client.hpp"
@@ -55,22 +59,29 @@ struct PoolFixture {
     return true;
 }
 
-[[nodiscard]] std::optional<WireResponse> send_raw(uint16_t port, std::string_view request) {
+[[nodiscard]] util::UniqueFd connect_to(uint16_t port) {
     util::UniqueFd socket{::socket(AF_INET, SOCK_STREAM, 0)};
     if (!socket)
-        return std::nullopt;
+        return {};
 
     timeval timeout{};
     timeout.tv_sec = kSocketTimeoutSeconds;
     if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
-        return std::nullopt;
+        return {};
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
     if (::inet_pton(AF_INET, kLoopbackAddress.data(), &address.sin_addr) != 1)
-        return std::nullopt;
+        return {};
     if (::connect(socket.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
+        return {};
+    return socket;
+}
+
+[[nodiscard]] std::optional<WireResponse> send_raw(uint16_t port, std::string_view request) {
+    auto socket = connect_to(port);
+    if (!socket)
         return std::nullopt;
     if (!send_all(socket.get(), request))
         return std::nullopt;
@@ -226,4 +237,37 @@ TEST_CASE("HTTP request bodies are rejected before routing") {
         "close\r\n\r\nx");
     REQUIRE(response.has_value());
     CHECK(response->status == 413);
+}
+
+TEST_CASE("HTTP connections are capped and service recovers when slots are released") {
+    PoolFixture fixture;
+    std::vector<util::UniqueFd> held;
+    const auto hold_connection = [&] {
+        auto socket = connect_to(fixture.server.port());
+        REQUIRE(socket);
+        REQUIRE(send_all(socket.get(), "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n"));
+        held.push_back(std::move(socket));
+    };
+    for (unsigned connection = 0; connection < api::kMaxConnections - 1; ++connection)
+        hold_connection();
+
+    const auto last_slot = request(fixture, "GET", "/health");
+    REQUIRE(last_slot.has_value());
+    CHECK(last_slot->status == 503);
+    hold_connection();
+    CHECK_FALSE(request(fixture, "GET", "/health").has_value());
+
+    held.clear();
+    constexpr auto kRecoveryWait = std::chrono::seconds(2);
+    constexpr auto kRetryInterval = std::chrono::milliseconds(10);
+    const auto deadline = std::chrono::steady_clock::now() + kRecoveryWait;
+    std::optional<WireResponse> recovered;
+    do {
+        recovered = request(fixture, "GET", "/health");
+        if (recovered)
+            break;
+        std::this_thread::sleep_for(kRetryInterval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->status == 503);
 }

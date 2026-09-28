@@ -22,6 +22,7 @@ public:
     BlockTemplate fetch_template() override { return client_.getblocktemplate_parsed(); }
     MiningTip get_mining_tip() { return client_.get_mining_tip(); }
     HeaderFacts fetch_header(const std::string& block_hash) override;
+    BlockStanding block_standing(const std::string& block_hash) override;
     std::optional<std::string> submit_block_hex(const std::string& block_hex) override {
         return client_.submitblock(block_hex);
     }

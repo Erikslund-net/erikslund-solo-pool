@@ -23,6 +23,14 @@ struct HeaderFacts {
     uint32_t mediantime = 0;     // MTP -> the ntime floor (curtime = max(now, MTP + 1))
 };
 
+// How the serving node regards a block the pool is building on.
+enum class BlockStanding {
+    Unknown,   // the source cannot tell
+    Active,    // in the node's active chain
+    Pending,   // not active yet: unknown to the node or its branch is not fully validated
+    Abandoned, // the node marked its branch invalid or reorganized onto another chain
+};
+
 class WorkSource {
 public:
     virtual ~WorkSource() = default;
@@ -39,6 +47,12 @@ public:
 
     // Grounds the fastblock empty job. May throw.
     virtual HeaderFacts fetch_header(const std::string& block_hash) = 0;
+
+    // Separates a node that abandoned the pool's current parent from one still catching up to it,
+    // which decides whether a lower-height template may replace current work. May throw.
+    virtual BlockStanding block_standing(const std::string& /*block_hash*/) {
+        return BlockStanding::Unknown;
+    }
 
     // Full-block submission stays on RPC even when templates come from IPC. This keeps live submits
     // and spool replay on one durable path and avoids coupling a share to mutable IPC template state.

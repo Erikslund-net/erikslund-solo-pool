@@ -1,13 +1,158 @@
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "core/logging.hpp"
 
 using namespace erikslund;
+
+TEST_CASE("log rate limits report suppressed messages at the next permitted emission") {
+    using namespace std::chrono_literals;
+    log::RateLimit limit(30s);
+    const auto start = std::chrono::steady_clock::time_point{};
+    CHECK(limit.admit(start) == 0);
+    CHECK_FALSE(limit.admit(start));
+    CHECK_FALSE(limit.admit(start + 29s));
+    CHECK(limit.admit(start + 30s) == 2);
+    CHECK(limit.admit(start + 60s) == 0);
+}
+
+TEST_CASE("log rate limits share one budget across concurrent callers") {
+    using namespace std::chrono_literals;
+    constexpr unsigned caller_count = 32;
+    log::RateLimit limit(30s);
+    const auto start = std::chrono::steady_clock::time_point{};
+    std::atomic<unsigned> permitted{0};
+    {
+        std::vector<std::jthread> callers;
+        for (unsigned caller = 0; caller < caller_count; ++caller)
+            callers.emplace_back([&] {
+                if (limit.admit(start))
+                    permitted.fetch_add(1, std::memory_order_relaxed);
+            });
+    }
+    CHECK(permitted.load() == 1);
+    CHECK(limit.admit(start + 30s) == caller_count - 1);
+}
+
+TEST_CASE("single-message log limits restart the interval after a late emission") {
+    using namespace std::chrono_literals;
+    log::RateLimit limit;
+    const auto start = std::chrono::steady_clock::time_point{};
+    CHECK(limit.admit(start) == 0);
+    CHECK(limit.admit(start + 45s) == 0);
+    CHECK_FALSE(limit.admit(start + 60s));
+    CHECK(limit.admit(start + 75s) == 1);
+}
+
+TEST_CASE("operational log limits admit a reconnect burst then refill one message per second") {
+    using namespace std::chrono_literals;
+    log::RateLimit limit(log::kOperationalMessageInterval, log::kOperationalMessageBurst);
+    const auto start = std::chrono::steady_clock::time_point{};
+    for (unsigned message = 0; message < log::kOperationalMessageBurst; ++message)
+        CHECK(limit.admit(start) == 0);
+    CHECK_FALSE(limit.admit(start));
+    CHECK_FALSE(limit.admit(start + 999ms));
+    CHECK(limit.admit(start + 1s) == 2);
+    CHECK_FALSE(limit.admit(start + 1s));
+    CHECK(limit.admit(start + 2s) == 1);
+}
+
+TEST_CASE("log bucket refill retains partial intervals without accumulating beyond the burst") {
+    using namespace std::chrono_literals;
+    log::RateLimit limit(log::kOperationalMessageInterval, log::kOperationalMessageBurst);
+    const auto start = std::chrono::steady_clock::time_point{};
+    for (unsigned message = 0; message < log::kOperationalMessageBurst; ++message)
+        REQUIRE(limit.admit(start).has_value());
+
+    CHECK(limit.admit(start + 1'500ms) == 0);
+    CHECK_FALSE(limit.admit(start + 1'999ms));
+    CHECK(limit.admit(start + 2s) == 1);
+
+    const auto rested = start + 1h + 500ms;
+    for (unsigned message = 0; message < log::kOperationalMessageBurst; ++message)
+        CHECK(limit.admit(rested) == 0);
+    CHECK_FALSE(limit.admit(rested));
+    CHECK_FALSE(limit.admit(rested + 999ms));
+    CHECK(limit.admit(rested + 1s) == 2);
+}
+
+TEST_CASE("log bucket suppression counts are reported once when multiple tokens refill") {
+    using namespace std::chrono_literals;
+    log::RateLimit limit(log::kOperationalMessageInterval, log::kOperationalMessageBurst);
+    const auto start = std::chrono::steady_clock::time_point{};
+    for (unsigned message = 0; message < log::kOperationalMessageBurst; ++message)
+        REQUIRE(limit.admit(start).has_value());
+    constexpr unsigned kSuppressed = 7;
+    for (unsigned message = 0; message < kSuppressed; ++message)
+        CHECK_FALSE(limit.admit(start));
+    CHECK(limit.admit(start + 3s) == kSuppressed);
+    CHECK(limit.admit(start + 3s) == 0);
+    CHECK(limit.admit(start + 3s) == 0);
+    CHECK_FALSE(limit.admit(start + 3s));
+    CHECK(limit.admit(start + 4s) == 1);
+}
+
+TEST_CASE("operational log buckets share their burst across concurrent callers") {
+    using namespace std::chrono_literals;
+    constexpr unsigned kCallers = 16;
+    constexpr unsigned kMessagesPerCaller = 8;
+    log::RateLimit limit(log::kOperationalMessageInterval, log::kOperationalMessageBurst);
+    const auto start = std::chrono::steady_clock::time_point{};
+    std::atomic<unsigned> permitted{0};
+    {
+        std::vector<std::jthread> callers;
+        for (unsigned caller = 0; caller < kCallers; ++caller)
+            callers.emplace_back([&] {
+                for (unsigned message = 0; message < kMessagesPerCaller; ++message)
+                    if (limit.admit(start))
+                        permitted.fetch_add(1, std::memory_order_relaxed);
+            });
+    }
+    CHECK(permitted.load() == log::kOperationalMessageBurst);
+    CHECK(limit.admit(start + 1s) == kCallers * kMessagesPerCaller - log::kOperationalMessageBurst);
+    CHECK_FALSE(limit.admit(start + 1s));
+}
+
+TEST_CASE("log buckets handle out-of-order timestamps without refilling backwards") {
+    using namespace std::chrono_literals;
+    log::RateLimit limit(1s, 2);
+    const auto start = std::chrono::steady_clock::time_point{};
+    CHECK(limit.admit(start + 1s) == 0);
+    CHECK(limit.admit(start) == 0);
+    CHECK_FALSE(limit.admit(start));
+    CHECK_FALSE(limit.admit(start + 1'999ms));
+    CHECK(limit.admit(start + 2s) == 2);
+}
+
+TEST_CASE("log bucket defaults remain safe for zero burst and nonpositive intervals") {
+    using namespace std::chrono_literals;
+    const auto start = std::chrono::steady_clock::time_point{};
+    log::RateLimit zero_burst(1s, 0);
+    CHECK(zero_burst.admit(start) == 0);
+    CHECK_FALSE(zero_burst.admit(start));
+    for (const auto interval : {0s, -1s}) {
+        log::RateLimit unlimited(interval, log::kOperationalMessageBurst);
+        for (unsigned message = 0; message <= log::kOperationalMessageBurst; ++message)
+            CHECK(unlimited.admit(start) == 0);
+    }
+}
+
+TEST_CASE("disabled log messages do not consume the rate limit") {
+    log::RateLimit limit;
+    const auto previous_level = log::level();
+    log::set_level(log::Level::Warning);
+    log::message_limited(log::Level::Info, limit, "hidden message");
+    log::set_level(previous_level);
+    CHECK(limit.admit() == 0);
+}
 
 TEST_CASE("set_log_file tees log lines to an append-only file and disables cleanly") {
     namespace fs = std::filesystem;

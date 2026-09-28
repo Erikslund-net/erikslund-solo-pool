@@ -416,4 +416,8 @@ glz::generic RpcClient::getblockchaininfo() {
     return call("getblockchaininfo");
 }
 
+glz::generic RpcClient::getchaintips() {
+    return call("getchaintips");
+}
+
 } // namespace erikslund::bitcoin

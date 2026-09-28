@@ -84,7 +84,11 @@ constexpr int kMaxEventsPerWait = 64;        // epoll_event batch size
 constexpr int kEpollWaitTimeoutMs = 500;
 constexpr size_t kReadChunkBytes = 4096;     // per-recv() read buffer
 constexpr size_t kMaxReadBytesPerEvent = size_t{32} * 1024;
+// Input a closing connection had already queued (a peer that reset after pipelining shares leaves
+// them readable) is still processed, up to this bound, before the connection is removed.
+constexpr size_t kMaxDrainBytesAfterClose = size_t{64} * 1024;
 constexpr int kListenBacklog = 1024;
+constexpr std::chrono::milliseconds kAcceptErrorBackoff{100};
 constexpr int kProxyHeaderTimeoutMs = 2000;  // PROXY header read deadline
 // PROXY-header reads run on this bounded pool, off the acceptor thread, so a stalled/partial header
 // can't block accept(). Excess past the queue cap is shed. Both bounds count toward max_clients.
@@ -465,6 +469,13 @@ uint16_t Server::bound_port(WireProtocol protocol) const {
 }
 
 void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
+    // Shared by every reactor so adding workers cannot multiply the log budget.
+    static log::RateLimit disconnect_log{log::kOperationalMessageInterval,
+                                         log::kOperationalMessageBurst};
+    static log::RateLimit timeout_log;
+    static log::RateLimit protocol_error_log;
+    static log::RateLimit handler_error_log;
+    static log::RateLimit noise_failure_log;
     const auto release_noise_handshake_slot = [this](ClientConnection* connection) {
         if (!connection->holds_noise_handshake_slot)
             return;
@@ -503,8 +514,9 @@ void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
             status == SV2_NOISE_OK
                 ? "invalid encrypted stream"
                 : sv2_noise_status_string(status);
-        log::debug("SV2 Noise {} failed for {}: {}", phase,
-                   connection->socket->peer(), reason);
+        log::message_limited(log::Level::Debug, noise_failure_log,
+                             "SV2 Noise {} failed for {}: {}", phase,
+                             connection->socket->peer(), reason);
     };
 
     const auto finish_noise_transport = [](ClientConnection* connection) {
@@ -525,23 +537,45 @@ void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
             connection->noise_connection->handshake_complete()) {
             if (connection->protocol == WireProtocol::Sv1 ||
                 connection->session->ever_authorized())
-                log::info("Client disconnected: {}",
-                          connection->socket->peer());
+                log::message_limited(log::Level::Info, disconnect_log,
+                                     "Client disconnected: {}", connection->socket->peer());
             else
-                log::debug("Client disconnected before authorization: {}",
-                           connection->socket->peer());
+                log::message_limited(log::Level::Debug, disconnect_log,
+                                     "Client disconnected before authorization: {}",
+                                     connection->socket->peer());
         }
         worker.connections.erase(fd); // dtor closes the fd
     };
 
+    // Whether a closing connection's queued input can still be parsed. SV1 lines stay framed after a
+    // failed write or a control-budget close; SV2 needs an intact stream and session.
+    const auto drains_before_close = [](const ClientConnection* connection) {
+        switch (connection->protocol) {
+        case WireProtocol::Sv1:
+            return true;
+        case WireProtocol::Sv2Plaintext:
+            return !connection->session->should_close();
+        case WireProtocol::Sv2Noise:
+            return !connection->noise_connection->terminal() &&
+                   !connection->session->should_close();
+        }
+        return false;
+    };
+
+    // Returns false once the connection has been removed. A connection that must close keeps
+    // reading until its queued input is exhausted or kMaxDrainBytesAfterClose is spent.
     const auto handle_readable = [&](ClientConnection* connection) -> bool {
         char chunk[kReadChunkBytes];
         size_t consumed_this_event = 0;
+        size_t drained_after_close = 0;
+        bool draining = false;
         const auto event_time = std::chrono::steady_clock::now();
         while (true) {
             const ssize_t n = ::recv(connection->fd, chunk, sizeof(chunk), 0);
             if (n > 0) {
                 consumed_this_event += static_cast<size_t>(n);
+                if (draining)
+                    drained_after_close += static_cast<size_t>(n);
                 connection->last_activity = event_time;
                 connection->socket->cork();
                 if (connection->protocol == WireProtocol::Sv1) {
@@ -589,44 +623,71 @@ void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
                     max_protocol_errors_.load(std::memory_order_relaxed);
                 if (max_protocol_errors > 0 &&
                     connection->session->protocol_errors() >= max_protocol_errors) {
-                    log::info("Client {} exceeded the protocol-error budget ({}); disconnecting",
-                              connection->socket->peer(), max_protocol_errors);
+                    log::message_limited(
+                        log::Level::Info, protocol_error_log,
+                        "Client {} exceeded the protocol-error budget ({}); disconnecting",
+                        connection->socket->peer(), max_protocol_errors);
                     remove_connection(connection);
                     return false;
                 }
                 if (connection->should_close()) {
-                    report_noise_failure(connection);
-                    remove_connection(connection);
-                    return false;
+                    if (!drains_before_close(connection) ||
+                        drained_after_close >= kMaxDrainBytesAfterClose) {
+                        report_noise_failure(connection);
+                        remove_connection(connection);
+                        return false;
+                    }
+                    draining = true;
                 }
                 if (connection->protocol == WireProtocol::Sv1 &&
                     connection->buffer.size() > max_line_bytes_) {
-                    log::info("Client {} sent an over-long line; disconnecting",
-                              connection->socket->peer());
+                    log::message_limited(log::Level::Info, protocol_error_log,
+                                         "Client {} sent an over-long line; disconnecting",
+                                         connection->socket->peer());
                     remove_connection(connection);
                     return false;
                 }
                 // Yield to other connections after the per-event budget; level-triggered EPOLLIN
-                // re-fires for what's still buffered, so no data is lost.
-                if (consumed_this_event >= kMaxReadBytesPerEvent)
+                // re-fires for what's still buffered, so no data is lost. A draining connection
+                // finishes now instead: it is bounded by kMaxDrainBytesAfterClose.
+                if (!draining && consumed_this_event >= kMaxReadBytesPerEvent)
                     return true;
                 continue;
             }
             if (n == 0) { // orderly EOF
                 if (connection->protocol == WireProtocol::Sv2Noise &&
                     !connection->noise_connection->finish())
-                    log::debug("Incomplete SV2 Noise stream from {}",
-                               connection->socket->peer());
+                    log::message_limited(log::Level::Debug, noise_failure_log,
+                                         "Incomplete SV2 Noise stream from {}",
+                                         connection->socket->peer());
                 remove_connection(connection);
                 return false;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return true; // socket drained
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!draining)
+                    return true; // socket drained
+                remove_connection(connection); // closing, and nothing more is queued
+                return false;
+            }
             if (errno == EINTR)
                 continue;
             remove_connection(connection); // hard error
             return false;
         }
+    };
+
+    // Remove a connection that must close, first processing input it already queued.
+    const auto reap = [&](ClientConnection* connection) {
+        try {
+            if (drains_before_close(connection) && !handle_readable(connection))
+                return; // drained and removed
+        } catch (const std::exception& e) {
+            log::message_limited(log::Level::Warning, handler_error_log,
+                                 "Client {} handler error ({}); disconnecting",
+                                 connection->socket->peer(), e.what());
+        }
+        report_noise_failure(connection);
+        remove_connection(connection);
     };
 
     // Adopt accepted fds: create the session and register with epoll.
@@ -701,7 +762,9 @@ void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
                     release_noise_handshake();
                 if (!socket)
                     ::close(fd);
-                log::warning("Could not adopt a mining client: {}", error.what());
+                static log::RateLimit adoption_log;
+                log::message_limited(log::Level::Warning, adoption_log,
+                                     "Could not adopt a mining client: {}", error.what());
             }
             worker.pending.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -712,30 +775,35 @@ void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
         const auto now = std::chrono::steady_clock::now();
         const int drop_idle_seconds = drop_idle_seconds_.load(std::memory_order_relaxed);
         const int auth_timeout_seconds = auth_timeout_seconds_.load(std::memory_order_relaxed);
+        std::vector<ClientConnection*> closing;
         std::vector<ClientConnection*> expired;
         for (auto& [fd, connection] : worker.connections) {
             if (connection->should_close()) {
-                report_noise_failure(connection.get());
-                expired.push_back(connection.get());
+                closing.push_back(connection.get());
             } else if (connection->protocol == WireProtocol::Sv2Noise &&
                 !connection->noise_connection->handshake_complete() &&
                 now - connection->created_at > kNoiseHandshakeTimeout) {
-                log::debug("SV2 Noise handshake timed out for {}",
-                           connection->socket->peer());
+                log::message_limited(log::Level::Debug, noise_failure_log,
+                                     "SV2 Noise handshake timed out for {}",
+                                     connection->socket->peer());
                 expired.push_back(connection.get());
             } else if (drop_idle_seconds > 0 &&
                 now - connection->last_activity > std::chrono::seconds(drop_idle_seconds)) {
-                log::info("Client {} idle for over {}s; disconnecting", connection->socket->peer(),
-                          drop_idle_seconds);
+                log::message_limited(log::Level::Info, timeout_log,
+                                     "Client {} idle for over {}s; disconnecting",
+                                     connection->socket->peer(), drop_idle_seconds);
                 expired.push_back(connection.get());
             } else if (auth_timeout_seconds > 0 &&
                        now - connection->created_at > std::chrono::seconds(auth_timeout_seconds) &&
                        !connection->session->ever_authorized()) {
-                log::info("Client {} did not authorize within {}s; disconnecting",
-                          connection->socket->peer(), auth_timeout_seconds);
+                log::message_limited(log::Level::Info, timeout_log,
+                                     "Client {} did not authorize within {}s; disconnecting",
+                                     connection->socket->peer(), auth_timeout_seconds);
                 expired.push_back(connection.get());
             }
         }
+        for (ClientConnection* connection : closing)
+            reap(connection);
         for (ClientConnection* connection : expired)
             remove_connection(connection);
     };
@@ -786,14 +854,15 @@ void Server::worker_loop(ServerWorker& worker, const std::stop_token& stop) {
                     continue;
                 if (event & EPOLLOUT) {
                     if (!connection->socket->flush_outbox()) {
-                        remove_connection(connection);
+                        reap(connection);
                         continue;
                     }
                 }
             } catch (const std::exception& e) {
                 // Isolate: one bad message drops only this client, not the reactor.
-                log::warning("Client {} handler error ({}); disconnecting",
-                             connection->socket->peer(), e.what());
+                log::message_limited(log::Level::Warning, handler_error_log,
+                                     "Client {} handler error ({}); disconnecting",
+                                     connection->socket->peer(), e.what());
                 remove_connection(connection);
             }
         }
@@ -897,8 +966,11 @@ void Server::proxy_reader_loop(const std::stop_token& stop) {
         // The blocking read happens here, on a pool thread, never on the acceptor.
         const auto header = read_proxy_header(job.fd, kProxyHeaderTimeoutMs);
         if (header.kind == ProxyHeaderKind::Malformed) {
-            log::warning("PROXY protocol: malformed header from {}; dropping (first bytes: {})",
-                         job.peer, header.detail);
+            static log::RateLimit malformed_proxy_log;
+            log::message_limited(
+                log::Level::Warning, malformed_proxy_log,
+                "PROXY protocol: malformed header from {}; dropping (first bytes: {})",
+                job.peer, header.detail);
             ::close(job.fd);
         } else {
             std::string peer;
@@ -944,6 +1016,12 @@ void Server::run(const std::stop_token& stop) {
         poll_fds.push_back({listener.socket.get(), POLLIN, 0});
 
     size_t next_worker = 0;
+    log::RateLimit accept_error_log;
+    log::RateLimit admission_log;
+    log::RateLimit proxy_queue_log;
+    log::RateLimit noise_admission_log;
+    std::mutex accept_retry_mutex;
+    std::condition_variable_any accept_retry_cv;
     while (!stop.stop_requested()) {
         for (auto& poll_fd : poll_fds)
             poll_fd.revents = 0;
@@ -951,17 +1029,31 @@ void Server::run(const std::stop_token& stop) {
         if (ready <= 0)
             continue;
 
-        for (size_t i = 0; i < poll_fds.size(); ++i) {
+        for (size_t i = 0; i < poll_fds.size() && !stop.stop_requested(); ++i) {
             if (!(poll_fds[i].revents & POLLIN))
                 continue;
-            while (true) {
+            while (!stop.stop_requested()) {
                 sockaddr_storage addr{};
                 socklen_t addr_len = sizeof(addr);
                 const int fd =
                     ::accept(listeners_[i].socket.get(),
                              reinterpret_cast<sockaddr*>(&addr), &addr_len);
-                if (fd < 0)
+                if (fd < 0) {
+                    const int accept_error = errno;
+                    if (accept_error == EINTR || accept_error == ECONNABORTED)
+                        continue;
+                    if (accept_error == EAGAIN || accept_error == EWOULDBLOCK)
+                        break;
+                    log::message_limited(log::Level::Warning, accept_error_log,
+                                         "Could not accept mining client: {}; retrying",
+                                         std::strerror(accept_error));
+                    // Resource exhaustion leaves the listener readable. Delay its next accept
+                    // without holding up established miners on the independent reactors.
+                    std::unique_lock retry_lock(accept_retry_mutex);
+                    accept_retry_cv.wait_for(retry_lock, stop, kAcceptErrorBackoff,
+                                             [] { return false; });
                     break;
+                }
                 // Capture the peer now -- a client that closes immediately would otherwise read
                 // back "unknown" via a later getpeername().
                 std::string peer = describe_peer(addr);
@@ -974,22 +1066,24 @@ void Server::run(const std::stop_token& stop) {
                 const size_t occupied_slots = pool_.client_count() + pending_total;
                 const int max_clients = max_clients_.load(std::memory_order_relaxed);
                 if (occupied_slots >= static_cast<size_t>(max_clients)) {
-                    log::warning("Max clients ({}) reached; dropping connection", max_clients);
+                    log::message_limited(log::Level::Warning, admission_log,
+                                         "Max clients ({}) reached; dropping connection",
+                                         max_clients);
                     ::close(fd);
                     continue;
                 }
                 const WireProtocol protocol = listeners_[i].protocol;
                 if (protocol != WireProtocol::Sv1 &&
                     occupied_slots >= sv2_admission_limit(max_clients)) {
-                    log::debug(
-                        "SV2 client limit reached; reserving capacity for SV1");
+                    log::message_limited(log::Level::Debug, noise_admission_log,
+                                         "SV2 client limit reached; reserving capacity for SV1");
                     ::close(fd);
                     continue;
                 }
                 if (protocol == WireProtocol::Sv2Noise &&
                     !reserve_noise_handshake()) {
-                    log::debug(
-                        "SV2 Noise handshake limit reached; dropping connection");
+                    log::message_limited(log::Level::Debug, noise_admission_log,
+                                         "SV2 Noise handshake limit reached; dropping connection");
                     ::close(fd);
                     continue;
                 }
@@ -1002,7 +1096,9 @@ void Server::run(const std::stop_token& stop) {
                         // parsed.
                         const size_t worker_index = next_worker++ % worker_count_;
                         if (!enqueue_proxy_read(fd, std::move(peer), worker_index)) {
-                            log::warning("PROXY-header reader queue full; dropping connection");
+                            log::message_limited(
+                                log::Level::Warning, proxy_queue_log,
+                                "PROXY-header reader queue full; dropping connection");
                             ::close(fd);
                         }
                         continue;

@@ -2,6 +2,8 @@
 // One Session per TCP connection: per-connection protocol state, reaching the pool
 // through the Connection and PoolContext interfaces.
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -24,7 +26,7 @@ namespace erikslund::stratum {
 
 inline constexpr size_t kMaxSeenShares = 16384;
 
-struct SessionTestPeek; // test-only access to private dedup internals
+struct SessionTestPeek; // test-only access to dedup and control-rate state
 
 // Outbound side of a connection (socket in prod, recorder in tests).
 class Connection : public virtual mining::Connection {
@@ -99,7 +101,7 @@ public:
     bool authorized() const { return authorized_; }
     bool ever_authorized() const override { return authorized_; }
     int protocol_errors() const override { return protocol_errors_; }
-    bool should_close() const override { return false; }
+    bool should_close() const override { return close_requested_.load(std::memory_order_relaxed); }
     const std::string& extranonce1_hex() const { return extranonce1_hex_; }
     double difficulty() const { return difficulty_; }
     uint32_t version_mask() const { return version_mask_; }
@@ -114,6 +116,7 @@ public:
     mining::ClientStats stats(bool include_worker_accounting = false) const override;
 
 private:
+    bool allow_control_request(std::chrono::steady_clock::time_point now);
     void dispatch(const Request& request);
     void handle_subscribe(const glz::generic& id, const std::vector<std::string>& params);
     void handle_configure(const Request& request);
@@ -149,7 +152,7 @@ private:
     std::shared_ptr<const Coinbase2Cache> coinbase2_for(const Job& job);
     bool remember(std::string key);
 
-    friend struct SessionTestPeek; // test-only reach into remember()/the dedup sets
+    friend struct SessionTestPeek;
 
     PoolContext& pool_;
     Connection& connection_;
@@ -160,6 +163,12 @@ private:
     bool subscribed_ = false;
     bool authorized_ = false;
     int protocol_errors_ = 0; // client-misbehaviour errors counted toward the disconnect budget
+    // Control traffic gets a separate budget: accepted shares must not replenish it.
+    static constexpr double kControlRequestBurst = 16.0;
+    static constexpr double kControlRequestsPerSecond = 1.0;
+    double control_request_tokens_ = kControlRequestBurst;
+    std::chrono::steady_clock::time_point control_refill_at_ = std::chrono::steady_clock::now();
+    std::atomic<bool> close_requested_{false};
     std::optional<std::string> address_;
     std::optional<std::string> worker_;
     std::optional<Bytes> payout_script_;

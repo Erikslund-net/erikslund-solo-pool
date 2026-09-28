@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <format>
 #include <functional>
@@ -23,11 +24,19 @@ using namespace erikslund::test;
 using json = glz::generic;
 
 namespace erikslund::stratum {
-// Test-only window into Session's private dedup internals (friend of Session).
+// Test-only window into Session's dedup and control-rate state.
 struct SessionTestPeek {
     static bool remember(Session& s, std::string key) { return s.remember(std::move(key)); }
     static size_t current_size(const Session& s) { return s.seen_shares_current_.size(); }
     static size_t previous_size(const Session& s) { return s.seen_shares_previous_.size(); }
+    static size_t control_burst() { return static_cast<size_t>(Session::kControlRequestBurst); }
+    static auto control_time(const Session& session) { return session.control_refill_at_; }
+    static bool allow_control(Session& session, std::chrono::steady_clock::time_point now) {
+        return session.allow_control_request(now);
+    }
+    static void freeze_control_refill(Session& session) {
+        session.control_refill_at_ = std::chrono::steady_clock::time_point::max();
+    }
 };
 } // namespace erikslund::stratum
 
@@ -309,6 +318,7 @@ TEST_CASE("authorize rejects an invalid address") {
     REQUIRE(reply.has_value());
     CHECK((*reply)["result"].get<bool>() == false);
     CHECK_FALSE(f.session.authorized());
+    CHECK(f.session.protocol_errors() == 1);
 }
 
 TEST_CASE("re-authorize to a DIFFERENT payout address on one connection is refused") {
@@ -327,6 +337,7 @@ TEST_CASE("re-authorize to a DIFFERENT payout address on one connection is refus
     const auto reply = f.conn.by_id(9);
     REQUIRE(reply.has_value());
     CHECK((*reply)["result"].get<bool>() == false);
+    CHECK(f.session.protocol_errors() == 1);
     // The original identity survives intact.
     CHECK(f.session.authorized());
     CHECK(*f.session.address() == first);
@@ -344,6 +355,105 @@ TEST_CASE("re-authorize to the SAME address rebinds the worker name") {
     CHECK(f.session.authorized());
     CHECK(*f.session.address() == "validaddr");
     CHECK(*f.session.worker() == "w2"); // same payout address -> worker rebind still allowed
+}
+
+TEST_CASE("control requests have a capped burst and refill once per second") {
+    Fixture fixture;
+    const auto start = SessionTestPeek::control_time(fixture.session);
+    for (size_t request = 0; request < SessionTestPeek::control_burst(); ++request)
+        REQUIRE(SessionTestPeek::allow_control(fixture.session, start));
+    CHECK_FALSE(fixture.session.should_close());
+    CHECK(SessionTestPeek::allow_control(fixture.session, start + std::chrono::seconds(1)));
+    CHECK(SessionTestPeek::allow_control(fixture.session, start + std::chrono::seconds(2)));
+
+    const auto later = start + std::chrono::hours(1);
+    for (size_t request = 0; request < SessionTestPeek::control_burst(); ++request)
+        REQUIRE(SessionTestPeek::allow_control(fixture.session, later));
+    CHECK_FALSE(SessionTestPeek::allow_control(fixture.session, later));
+    CHECK(fixture.session.should_close());
+    CHECK_FALSE(SessionTestPeek::allow_control(fixture.session, later + std::chrono::hours(1)));
+}
+
+TEST_CASE("successful repeated authorization exhausts only that connection's control budget") {
+    Fixture fixture;
+    SessionTestPeek::freeze_control_refill(fixture.session);
+    fixture.subscribe();
+    fixture.authorize("validaddr.original");
+    for (size_t request = 2; request < SessionTestPeek::control_burst(); ++request) {
+        fixture.authorize("validaddr.rebound");
+        CHECK_FALSE(fixture.session.should_close());
+    }
+    CHECK(fixture.session.protocol_errors() == 0);
+    CHECK(*fixture.session.worker() == "rebound");
+    const size_t attached_before = fixture.pool.attached.size();
+    fixture.conn.sent.clear();
+    fixture.authorize("validaddr.denied");
+    CHECK(fixture.session.should_close());
+    CHECK(fixture.conn.sent.empty());
+    CHECK(fixture.pool.attached.size() == attached_before);
+    CHECK(*fixture.session.address() == "validaddr");
+    CHECK(*fixture.session.worker() == "rebound");
+
+    // Connections behind one NAT are independent even though the fake peer is identical.
+    Fixture other;
+    other.subscribe();
+    other.authorize("validaddr.other");
+    CHECK(other.session.authorized());
+    CHECK_FALSE(other.session.should_close());
+}
+
+TEST_CASE("shares bypass an empty control budget without replenishing it") {
+    Fixture fixture;
+    SessionTestPeek::freeze_control_refill(fixture.session);
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker");
+    fixture.session.handle_line(
+        R"({"id":9,"method":"mining.authorize","params":["othervalidaddr.worker"]})");
+    REQUIRE(fixture.session.protocol_errors() == 1);
+    for (size_t request = 3; request < SessionTestPeek::control_burst(); ++request)
+        fixture.session.handle_line(R"({"id":10,"method":"mining.ping","params":[]})");
+    CHECK_FALSE(fixture.session.should_close());
+
+    const std::string nonce = find_accepted_nonce(
+        *fixture.pool.job, util::from_hex("e06ae06a"), fixture.session.difficulty(), true);
+    REQUIRE_FALSE(nonce.empty());
+    fixture.submit(11, nonce);
+    REQUIRE(fixture.conn.by_id(11).has_value());
+    CHECK((*fixture.conn.by_id(11))["result"].get<bool>());
+    CHECK(fixture.pool.block_found);
+    CHECK(fixture.session.protocol_errors() == 0);
+    for (size_t request = 0; request < SessionTestPeek::control_burst(); ++request)
+        fixture.submit(12, nonce);
+    CHECK_FALSE(fixture.session.should_close());
+
+    fixture.authorize("validaddr.worker");
+    CHECK(fixture.session.should_close());
+}
+
+TEST_CASE("a closing session still submits a block from the current read") {
+    Fixture fixture;
+    SessionTestPeek::freeze_control_refill(fixture.session);
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker");
+    const std::string block_nonce = find_accepted_nonce(
+        *fixture.pool.job, util::from_hex("e06ae06a"), fixture.session.difficulty(), true);
+    REQUIRE_FALSE(block_nonce.empty());
+
+    for (size_t request = 2; request <= SessionTestPeek::control_burst(); ++request)
+        fixture.session.handle_line(R"({"id":10,"method":"mining.ping","params":[]})");
+    REQUIRE(fixture.session.should_close());
+
+    fixture.conn.sent.clear();
+    fixture.authorize("validaddr.ignored");
+    CHECK(fixture.conn.sent.empty());
+    CHECK(*fixture.session.worker() == "worker");
+
+    fixture.submit(11, block_nonce);
+    REQUIRE(fixture.conn.by_id(11).has_value());
+    CHECK((*fixture.conn.by_id(11))["result"].get<bool>());
+    CHECK(fixture.pool.block_found);
+    CHECK(fixture.pool.accepted == 1);
+    CHECK(fixture.session.should_close());
 }
 
 TEST_CASE("re-authorize preserves one accounting identity across equivalent address spellings") {
