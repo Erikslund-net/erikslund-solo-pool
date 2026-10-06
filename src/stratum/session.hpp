@@ -126,11 +126,14 @@ private:
 
     // Caller holds mutex_; the public send_* wrap these.
     void do_send_set_difficulty();
-    std::string set_difficulty_line();
+    std::string prepare_difficulty_line();
     std::optional<std::string> build_notify_line(const Job& job, bool clean);
     void send_difficulty_then_work();
 
     void begin_difficulty_change(double new_difficulty);
+    double difficulty_cap(const RuntimeConfig& config) const;
+    bool apply_difficulty_limits(const RuntimeConfig& config);
+    void maybe_raise_fixed_difficulty(double now);
 
     void send(const glz::generic& message);
     void send_result(const glz::generic& id, glz::generic result);
@@ -175,6 +178,12 @@ private:
     stats::WorkerAccountingHandle worker_accounting_;
 
     double difficulty_;
+    bool fixed_difficulty_ = false;
+    double fixed_difficulty_requested_ = 0.0;
+    double fixed_difficulty_floor_ = 0.0;
+    double network_difficulty_limit_ = 0.0;
+    double fixed_share_window_started_ = 0.0;
+    uint64_t fixed_shares_in_window_ = 0;
     double previous_difficulty_ = 0.0;
     bool pending_difficulty_change_ = false;
     int64_t connected_at_ = 0;          // wall epoch: DISPLAYED
@@ -205,8 +214,7 @@ private:
     mutable std::mutex mutex_; // serializes handle_line vs. send_* across threads
 };
 
-// Pure vardiff decision (exposed for testing). New difficulty clamped to [min, max];
-// max 0 = no maximum (defaults to 1e12).
+// Pure vardiff decision (exposed for testing); max 0 means no maximum.
 double vardiff_next(double current, double shares_per_minute, double target,
                     double min_difficulty, double max_difficulty);
 

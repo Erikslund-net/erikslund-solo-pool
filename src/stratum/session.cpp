@@ -25,7 +25,13 @@ using json = glz::generic;
 
 namespace {
 constexpr std::chrono::seconds kControlLogInterval{1};
+constexpr std::chrono::seconds kNetworkDifficultyWarningInterval{30};
+constexpr double kSecondsPerMinute = 60.0;
+constexpr double kFixedShareWindowSeconds = kSecondsPerMinute;
+constexpr double kFixedShareRateThresholdPerMinute = 60.0;
+constexpr double kFixedShareRateTargetPerMinute = 30.0;
 log::RateLimit control_warning_limit{kControlLogInterval};
+log::RateLimit network_difficulty_warning_limit{kNetworkDifficultyWarningInterval};
 log::RateLimit authorization_log_limit{log::kOperationalMessageInterval,
                                       log::kOperationalMessageBurst};
 log::RateLimit difficulty_log_limit{log::kOperationalMessageInterval,
@@ -124,13 +130,28 @@ Session::Session(PoolContext& pool, Connection& connection, Bytes extranonce1)
       hashrate_(std::span<const int, stats::kHashrateWindows.size()>(stats::kHashrateWindows),
                 connected_at_steady_) {
     const auto config = pool.runtime_config();
-    difficulty_ = std::max(config->initial_difficulty, config->minimum_difficulty);
+    if (const auto job = pool.current_job())
+        network_difficulty_limit_ = job->maximum_share_difficulty();
+    const double cap = difficulty_cap(*config);
+    difficulty_ = std::clamp(config->initial_difficulty,
+                             std::min(config->minimum_difficulty, cap), cap);
 }
 
 void Session::maybe_retarget() {
     const std::scoped_lock lock(mutex_);
     const auto config = pool_.runtime_config();
-    if (!config->variable_difficulty || !authorized_)
+    if (!authorized_)
+        return;
+    if (apply_difficulty_limits(*config)) {
+        do_send_set_difficulty();
+        if (fixed_difficulty_)
+            log::message_limited(log::Level::Info, difficulty_log_limit,
+                                 "Fixed difficulty {} -> {} (difficulty limits)", connection_.peer(),
+                                 util::format_difficulty(difficulty_));
+    }
+    if (fixed_difficulty_)
+        return;
+    if (!config->variable_difficulty)
         return;
     const double now = stats::steady_seconds(); // monotonic
     const double elapsed = now - last_retarget_;
@@ -138,10 +159,12 @@ void Session::maybe_retarget() {
         return;
 
     const double shares_per_minute =
-        elapsed > 0.0 ? (static_cast<double>(shares_since_retarget_) / elapsed) * 60.0 : 0.0;
+        elapsed > 0.0 ? (static_cast<double>(shares_since_retarget_) / elapsed) * kSecondsPerMinute
+                      : 0.0;
+    const double cap = difficulty_cap(*config);
     const double new_difficulty =
         vardiff_next(difficulty_, shares_per_minute, config->vardiff_target_shares_per_minute,
-                     config->minimum_difficulty, config->maximum_difficulty);
+                     std::min(config->minimum_difficulty, cap), cap);
 
     shares_since_retarget_ = 0;
     last_retarget_ = now;
@@ -300,12 +323,14 @@ void Session::send_set_difficulty() {
     do_send_set_difficulty();
 }
 
-std::string Session::set_difficulty_line() {
+std::string Session::prepare_difficulty_line() {
+    const auto config = pool_.runtime_config();
+    apply_difficulty_limits(*config);
     return make_set_difficulty_line(difficulty_);
 }
 
 void Session::do_send_set_difficulty() {
-    connection_.send_line(set_difficulty_line());
+    connection_.send_line(prepare_difficulty_line());
 }
 
 void Session::send_notify(const Job& job, bool clean) {
@@ -315,8 +340,20 @@ void Session::send_notify(const Job& job, bool clean) {
         publication_sequence <=
             last_notified_publication_sequence_)
         return;
-    if (auto line = build_notify_line(job, clean))
-        connection_.send_line(*line);
+    if (!subscribed_ || !authorized_ || !payout_script_)
+        return;
+    network_difficulty_limit_ = job.maximum_share_difficulty();
+    const auto config = pool_.runtime_config();
+    const bool difficulty_changed = apply_difficulty_limits(*config);
+    if (auto line = build_notify_line(job, clean || difficulty_changed)) {
+        if (difficulty_changed) {
+            const std::string difficulty = make_set_difficulty_line(difficulty_);
+            const std::array<std::string_view, 2> flight{difficulty, *line};
+            connection_.send_lines(flight);
+        } else {
+            connection_.send_line(*line);
+        }
+    }
 }
 
 std::optional<std::string> Session::build_notify_line(const Job& job, bool clean) {
@@ -342,9 +379,12 @@ std::optional<std::string> Session::build_notify_line(const Job& job, bool clean
 }
 
 void Session::send_difficulty_then_work() {
-    const std::string difficulty = set_difficulty_line();
+    const auto job = pool_.current_job();
+    if (job)
+        network_difficulty_limit_ = job->maximum_share_difficulty();
+    const std::string difficulty = prepare_difficulty_line();
     std::optional<std::string> notify;
-    if (auto job = pool_.current_job())
+    if (job)
         notify = build_notify_line(*job, /*clean=*/true);
     if (notify) {
         const std::array<std::string_view, 2> flight{difficulty, *notify};
@@ -359,6 +399,78 @@ void Session::begin_difficulty_change(double new_difficulty) {
         previous_difficulty_ = difficulty_;
     difficulty_ = new_difficulty;
     pending_difficulty_change_ = true;
+}
+
+double Session::difficulty_cap(const RuntimeConfig& config) const {
+    double cap = config.maximum_difficulty > 0.0
+                     ? config.maximum_difficulty
+                     : std::numeric_limits<double>::max();
+    if (network_difficulty_limit_ > 0.0) {
+        cap = std::min(cap, network_difficulty_limit_);
+        if (network_difficulty_limit_ < config.minimum_difficulty)
+            log::message_limited(log::Level::Warning, network_difficulty_warning_limit,
+                                 "Network difficulty {} overrides minimum_difficulty {}",
+                                 network_difficulty_limit_, config.minimum_difficulty);
+    }
+    return cap;
+}
+
+bool Session::apply_difficulty_limits(const RuntimeConfig& config) {
+    double requested = difficulty_;
+    if (fixed_difficulty_) {
+        const double configured_cap = config.maximum_difficulty > 0.0
+                                          ? config.maximum_difficulty
+                                          : std::numeric_limits<double>::max();
+        fixed_difficulty_requested_ = std::clamp(
+            std::max(fixed_difficulty_requested_, fixed_difficulty_floor_),
+            config.minimum_difficulty, configured_cap);
+        requested = fixed_difficulty_requested_;
+    }
+    const double cap = difficulty_cap(config);
+    const double clamped = std::clamp(requested, std::min(config.minimum_difficulty, cap), cap);
+    if (clamped == difficulty_)
+        return false;
+    begin_difficulty_change(clamped);
+    return true;
+}
+
+void Session::maybe_raise_fixed_difficulty(double now) {
+    if (!fixed_difficulty_)
+        return;
+    if (fixed_shares_in_window_ < std::numeric_limits<uint64_t>::max())
+        ++fixed_shares_in_window_;
+    const double elapsed = now - fixed_share_window_started_;
+    if (elapsed < kFixedShareWindowSeconds)
+        return;
+
+    const double shares_per_minute =
+        static_cast<double>(fixed_shares_in_window_) * kSecondsPerMinute / elapsed;
+    fixed_shares_in_window_ = 0;
+    fixed_share_window_started_ = now;
+    if (shares_per_minute <= kFixedShareRateThresholdPerMinute)
+        return;
+
+    const auto config = pool_.runtime_config();
+    const double cap = difficulty_cap(*config);
+    const double multiplier = shares_per_minute / kFixedShareRateTargetPerMinute;
+    const double scaled_difficulty = difficulty_ >= cap / multiplier
+                                         ? cap
+                                         : difficulty_ * multiplier;
+    const double new_difficulty =
+        std::max(scaled_difficulty, std::min(config->minimum_difficulty, cap));
+    if (new_difficulty <= difficulty_)
+        return;
+
+    const double old_difficulty = difficulty_;
+    fixed_difficulty_floor_ = std::max(fixed_difficulty_floor_, new_difficulty);
+    begin_difficulty_change(new_difficulty);
+    send_difficulty_then_work();
+    if (difficulty_ <= old_difficulty)
+        return;
+    log::message_limited(log::Level::Info, difficulty_log_limit,
+                         "Raising fixed difficulty {}: {} -> {} ({:.1f} shares/min)",
+                         connection_.peer(), util::format_difficulty(old_difficulty),
+                         util::format_difficulty(difficulty_), shares_per_minute);
 }
 
 void Session::handle_subscribe(const json& id, const std::vector<std::string>& params) {
@@ -457,14 +569,20 @@ void Session::handle_authorize(const json& id, const std::vector<std::string>& p
         const auto config = pool_.runtime_config();
         if (const auto requested = difficulty_from_password(params[1]); requested) {
             const auto clamped = clamp_suggested_difficulty(
-                *requested, config->minimum_difficulty, config->maximum_difficulty);
-            if (clamped && *clamped != difficulty_) {
-                begin_difficulty_change(*clamped);
+                *requested, std::max(config->minimum_difficulty, fixed_difficulty_floor_),
+                config->maximum_difficulty);
+            if (clamped && !fixed_difficulty_) {
+                fixed_difficulty_ = true;
+                fixed_share_window_started_ = stats::steady_seconds();
+            }
+            if (clamped)
+                fixed_difficulty_requested_ = *clamped;
+            if (clamped && apply_difficulty_limits(*config)) {
                 shares_since_retarget_ = 0;
                 last_retarget_ = stats::steady_seconds();
                 log::message_limited(log::Level::Info, difficulty_log_limit,
                                      "Password difficulty {} -> {}", connection_.peer(),
-                                     util::format_difficulty(*clamped));
+                                     util::format_difficulty(difficulty_));
             }
         }
     }
@@ -482,11 +600,12 @@ void Session::handle_authorize(const json& id, const std::vector<std::string>& p
 
 void Session::handle_suggest_difficulty(const Request& request) {
     // Advisory: a missing/malformed value is acked but ignored. dispatch() holds mutex_.
-    if (request.suggested_difficulty) {
+    if (!fixed_difficulty_ && request.suggested_difficulty) {
         const auto config = pool_.runtime_config();
+        const double cap = difficulty_cap(*config);
         const auto clamped = clamp_suggested_difficulty(*request.suggested_difficulty,
-                                                         config->minimum_difficulty,
-                                                         config->maximum_difficulty);
+                                                         std::min(config->minimum_difficulty, cap),
+                                                         cap);
         if (clamped && *clamped != difficulty_) {
             begin_difficulty_change(*clamped);
             shares_since_retarget_ = 0; // restart the vardiff window at the new baseline
@@ -624,6 +743,8 @@ void Session::handle_submit(const json& id, const std::vector<std::string>& para
         const std::scoped_lock lock(mutex_);
         record_accepted_share_locked(credited, result->difficulty);
         send_result(id, true);
+        if (fixed_difficulty_)
+            maybe_raise_fixed_difficulty(stats::steady_seconds());
     }
     if (log::level() <= log::Level::Debug)
         log::debug("Accepted share from {} peer={} diff {}/{}", address, connection_.peer(),

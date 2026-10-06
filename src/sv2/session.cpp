@@ -29,6 +29,25 @@ constexpr double kNonceSpace = 4'294'967'296.0;
 constexpr double kMaximumJobSpaceUtilization = 0.8;
 constexpr double kJobRefreshSeconds =
     std::chrono::duration<double>(kStandardJobRefreshInterval).count();
+log::RateLimit network_difficulty_warning_limit;
+log::RateLimit incompatible_target_warning_limit;
+
+util::uint256 bounded_target(const util::uint256& requested_target,
+                             const util::uint256& device_maximum_target,
+                             const RuntimeConfig& config,
+                             const stratum::Job& job) {
+    if (config.minimum_difficulty > job.maximum_share_difficulty())
+        log::message_limited(log::Level::Warning, network_difficulty_warning_limit,
+                             "SV2 minimum difficulty {} exceeds network difficulty {}; "
+                             "using the network ceiling",
+                             util::format_difficulty(config.minimum_difficulty),
+                             util::format_difficulty(job.maximum_share_difficulty()));
+    util::uint256 target =
+        std::min(requested_target, util::target_from_difficulty(config.minimum_difficulty));
+    if (config.maximum_difficulty > 0.0)
+        target = std::max(target, util::target_from_difficulty(config.maximum_difficulty));
+    return std::max(std::min(target, device_maximum_target), job.network_target());
+}
 
 template <typename Message>
 void append_message(Bytes& destination, const Message& message) {
@@ -398,6 +417,15 @@ void Session::open_channel_locked(uint32_t request_id, std::string_view user_ide
             OpenMiningChannelError{request_id, "work-not-ready"}));
         return;
     }
+    if (maximum_target < current_job->network_target()) {
+        send_locked(encode_message(
+            OpenMiningChannelError{request_id, "unsupported-target"}));
+        log::message_limited(log::Level::Warning, incompatible_target_warning_limit,
+                             "Refused SV2 channel for {}: device maximum target "
+                             "is harder than the network target",
+                             connection_.peer());
+        return;
+    }
 
     const uint32_t channel_id = next_channel_id_;
     Channel channel(channel_id, kind, stats::steady_seconds());
@@ -408,9 +436,9 @@ void Session::open_channel_locked(uint32_t request_id, std::string_view user_ide
         pool_.attach_worker(channel.address, channel.worker);
     channel.device_maximum_target = maximum_target;
     const auto config = pool_.runtime_config();
-    channel.target = std::min(
+    channel.target = bounded_target(
         util::target_from_difficulty(difficulty_for_hashrate(nominal_hash_rate, *config)),
-        channel.device_maximum_target);
+        channel.device_maximum_target, *config, *current_job);
     channel.difficulty = util::difficulty_from_target(channel.target);
     channel.last_publication_sequence =
         current_job->publication_sequence();
@@ -482,6 +510,21 @@ void Session::handle_update_locked(const UpdateChannel& message) {
             UpdateChannelError{message.channel_id, "too-low-difficulty"}));
         return;
     }
+    if (channel.jobs.empty()) {
+        send_locked(encode_message(
+            UpdateChannelError{message.channel_id, "work-not-ready"}));
+        return;
+    }
+    const auto source_job = channel.jobs.back().second->source_job;
+    if (maximum_target < source_job->network_target()) {
+        send_locked(encode_message(
+            UpdateChannelError{message.channel_id, "unsupported-target"}));
+        log::message_limited(log::Level::Warning, incompatible_target_warning_limit,
+                             "Refused SV2 target update for {} channel {}: "
+                             "device maximum target is harder than the network target",
+                             connection_.peer(), channel.id);
+        return;
+    }
     const bool frequent_refresh_was_required =
         channel.requires_frequent_job_refresh;
     channel.device_maximum_target = maximum_target;
@@ -493,8 +536,8 @@ void Session::handle_update_locked(const UpdateChannel& message) {
         requested_target = util::target_from_difficulty(
             difficulty_for_hashrate(message.nominal_hash_rate, *config));
     }
-    requested_target =
-        std::min(requested_target, channel.device_maximum_target);
+    requested_target = bounded_target(requested_target, channel.device_maximum_target,
+                                      *config, *source_job);
     if (requested_target != channel.target) {
         change_target_locked(channel, requested_target);
     } else if (!frequent_refresh_was_required &&
@@ -569,6 +612,21 @@ void Session::build_job_work(JobBuildPlan& plan) {
 }
 
 void Session::commit_job_locked(Channel& channel, JobBuildPlan&& plan, bool clean) {
+    if (channel.device_maximum_target < plan.source_job->network_target()) {
+        const uint32_t channel_id = channel.id;
+        send_locked(encode_message(CloseChannel{channel_id, "unsupported-target"}));
+        channels_.erase(channel_id);
+        log::message_limited(log::Level::Warning, incompatible_target_warning_limit,
+                             "Closed SV2 channel {} for {}: device maximum target "
+                             "is harder than the new network target",
+                             channel_id, connection_.peer());
+        return;
+    }
+    const auto config = pool_.runtime_config();
+    const util::uint256 target = bounded_target(
+        channel.target, channel.device_maximum_target, *config, *plan.source_job);
+    if (target != channel.target)
+        change_target_locked(channel, target);
     const double now_steady = stats::steady_seconds();
     const bool new_prevhash = requires_new_prevhash_locked(channel, *plan.source_job);
     const bool clean_job = clean || new_prevhash ||
@@ -972,29 +1030,33 @@ void Session::finish_share_locked(const ShareSubmission& share,
 void Session::maybe_retarget() {
     const std::scoped_lock lock(mutex_);
     const auto config = pool_.runtime_config();
-    if (!config->variable_difficulty || channels_.empty())
+    if (channels_.empty())
         return;
     const double current_steady_time = stats::steady_seconds();
     for (auto& [channel_id, channel] : channels_) {
+        if (channel.jobs.empty())
+            continue;
+        const auto& source_job = channel.jobs.back().second->source_job;
         const double elapsed =
             current_steady_time - channel.last_retarget_at_steady;
-        if (elapsed < config->vardiff_retarget_seconds)
-            continue;
-
-        const double shares_per_minute =
-            elapsed > 0.0
-                ? static_cast<double>(channel.shares_since_retarget) / elapsed * 60.0
-                : 0.0;
-        channel.shares_since_retarget = 0;
-        channel.last_retarget_at_steady = current_steady_time;
-        const double requested_difficulty =
-            stratum::vardiff_next(channel.difficulty, shares_per_minute,
-                                  config->vardiff_target_shares_per_minute,
-                                  config->minimum_difficulty,
-                                  config->maximum_difficulty);
-        const util::uint256 new_target =
-            std::min(util::target_from_difficulty(requested_difficulty),
-                     channel.device_maximum_target);
+        util::uint256 requested_target = channel.target;
+        double shares_per_minute = 0.0;
+        if (config->variable_difficulty && elapsed >= config->vardiff_retarget_seconds) {
+            shares_per_minute =
+                elapsed > 0.0
+                    ? static_cast<double>(channel.shares_since_retarget) / elapsed * 60.0
+                    : 0.0;
+            channel.shares_since_retarget = 0;
+            channel.last_retarget_at_steady = current_steady_time;
+            const double requested_difficulty =
+                stratum::vardiff_next(channel.difficulty, shares_per_minute,
+                                      config->vardiff_target_shares_per_minute,
+                                      config->minimum_difficulty,
+                                      config->maximum_difficulty);
+            requested_target = util::target_from_difficulty(requested_difficulty);
+        }
+        const util::uint256 new_target = bounded_target(
+            requested_target, channel.device_maximum_target, *config, *source_job);
         if (new_target == channel.target)
             continue;
 

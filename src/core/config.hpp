@@ -64,7 +64,7 @@ struct Config {
     // Difficulty.
     double initial_difficulty = 1.0;
     double minimum_difficulty = 0.001;
-    double maximum_difficulty = 0.0; // vardiff upper clamp (0 = no maximum)
+    double maximum_difficulty = 0.0; // operator upper clamp (0 = network ceiling only)
 
     // Per-client retargeting toward a share rate.
     bool variable_difficulty = true;

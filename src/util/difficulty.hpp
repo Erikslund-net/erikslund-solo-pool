@@ -27,6 +27,7 @@ uint256 target_from_compact(uint32_t nbits);
 uint256 target_from_difficulty(double difficulty);
 double difficulty_from_target(const uint256& target);
 double difficulty_from_compact(uint32_t nbits);
+double maximum_difficulty_for_target(const uint256& target);
 bool meets_target(const uint256& hash, const uint256& target);
 
 } // namespace erikslund::util

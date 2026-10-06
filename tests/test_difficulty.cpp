@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -17,6 +18,7 @@ using namespace erikslund::util;
 namespace {
 
 constexpr std::size_t kWireCorpusSampleCount = 50'000;
+constexpr std::size_t kCompactCeilingSampleCount = 10'000;
 constexpr std::size_t kTargetByteCount = 32;
 constexpr std::size_t kWordByteCount = sizeof(uint64_t);
 constexpr std::size_t kByteBits = std::numeric_limits<uint8_t>::digits;
@@ -157,6 +159,91 @@ TEST_CASE("target conversion matches the pinned wire corpus") {
     }
 
     CHECK(fingerprint == kWireCorpusFingerprint);
+}
+
+TEST_CASE("maximum share difficulty includes every hash meeting the network target") {
+    for (const uint32_t bits : {0x01010000U, 0x03123456U, 0x1b0404cbU,
+                               0x1d00ffffU, 0x207fffffU}) {
+        CAPTURE(bits);
+        const auto target = target_from_compact(bits);
+        const double ceiling = maximum_difficulty_for_target(target);
+        CHECK(std::isfinite(ceiling));
+        CHECK(ceiling > 0.0);
+        CHECK(ceiling <= difficulty_from_target(target));
+        CHECK(target_from_difficulty(ceiling) >= target);
+        CHECK(maximum_difficulty_for_target(target) == ceiling);
+    }
+    CHECK(maximum_difficulty_for_target(target_from_compact(0x1d00ffff)) == 1.0);
+}
+
+TEST_CASE("maximum share difficulty rounds below an upward-rounded network difficulty") {
+    auto target_bytes = target_from_compact(0x1d00ffff).le_bytes();
+    target_bytes.front() = 1;
+    const auto target = uint256::from_le_bytes(target_bytes);
+
+    REQUIRE(difficulty_from_target(target) == 1.0);
+    const double ceiling = maximum_difficulty_for_target(target);
+    CHECK(ceiling == std::nextafter(1.0, 0.0));
+    CHECK(target_from_difficulty(ceiling) >= target);
+}
+
+TEST_CASE("maximum share difficulty avoids a target rounded below the network target") {
+    const auto target = target_from_compact(0x1d3d64c4);
+    REQUIRE(target_from_difficulty(difficulty_from_target(target)) < target);
+    const double ceiling = maximum_difficulty_for_target(target);
+    CHECK(ceiling < difficulty_from_target(target));
+    CHECK(target_from_difficulty(ceiling) >= target);
+}
+
+TEST_CASE("maximum share difficulty corrects a round-trip error after downward rounding") {
+    const auto target = uint256::from_display_hex(
+        "00000000000000000000000000000000000117e9f8f42d36f24b9093554cd786");
+    constexpr uint64_t kDownwardRoundedDifficultyBits = 0x46ed4404408705c9;
+    constexpr uint64_t kSafeDifficultyBits = 0x46ed4404408705c8;
+    const double downward_rounded = std::bit_cast<double>(kDownwardRoundedDifficultyBits);
+    REQUIRE(target_from_difficulty(downward_rounded) < target);
+
+    const double ceiling = maximum_difficulty_for_target(target);
+    CHECK(std::bit_cast<uint64_t>(ceiling) == kSafeDifficultyBits);
+    CHECK(target_from_difficulty(ceiling) >= target);
+}
+
+TEST_CASE("maximum share difficulty is safe across compact network targets") {
+    constexpr uint32_t kMinimumExponent = 3;
+    constexpr uint32_t kExponentCount = 30;
+    constexpr uint32_t kMantissaMask = 0x007fffff;
+    constexpr uint32_t kMinimumMantissa = 0x00010000;
+    constexpr unsigned kCompactExponentShift = 24;
+    uint64_t random_state = kSplitMixSeed;
+
+    for (std::size_t sample = 0; sample < kCompactCeilingSampleCount; ++sample) {
+        const uint32_t exponent = kMinimumExponent +
+            static_cast<uint32_t>(next_splitmix_word(random_state) % kExponentCount);
+        const uint32_t mantissa =
+            static_cast<uint32_t>(next_splitmix_word(random_state)) & kMantissaMask;
+        const uint32_t bits = (exponent << kCompactExponentShift) |
+                              (mantissa | kMinimumMantissa);
+        const auto target = target_from_compact(bits);
+        const double ceiling = maximum_difficulty_for_target(target);
+        CAPTURE(bits);
+        CHECK(std::isfinite(ceiling));
+        CHECK(ceiling > 0.0);
+        CHECK(ceiling <= difficulty_from_target(target));
+        CHECK(target_from_difficulty(ceiling) >= target);
+    }
+}
+
+TEST_CASE("maximum share difficulty handles the full nonzero target range") {
+    const auto maximum_target = uint256::from_display_hex(std::string(64, 'f'));
+    const auto minimum_target = target_from_compact(0x01010000);
+    for (const auto& target : {maximum_target, minimum_target}) {
+        const double ceiling = maximum_difficulty_for_target(target);
+        CHECK(std::isfinite(ceiling));
+        CHECK(ceiling > 0.0);
+        CHECK(target_from_difficulty(ceiling) >= target);
+    }
+    CHECK(maximum_difficulty_for_target(uint256{}) ==
+          std::numeric_limits<double>::infinity());
 }
 
 TEST_CASE("target_from_difficulty(0) yields the all-ones (max) target") {

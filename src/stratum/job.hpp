@@ -137,6 +137,8 @@ public:
     int64_t height() const { return height_; }
     int txn_count() const { return static_cast<int>(txn_count_); }
     double network_difficulty() const;
+    double maximum_share_difficulty() const { return maximum_share_difficulty_; }
+    const util::uint256& network_target() const { return network_target_; }
 
     // True if this job mines on top of `tip_display_hex` (display-order hash from bitcoind).
     bool mines_on(const std::string& tip_display_hex) const;
@@ -179,6 +181,7 @@ private:
     uint32_t bits_;
     uint64_t coinbase_value_;
     util::uint256 network_target_;
+    double maximum_share_difficulty_;
 
     Bytes prevhash_internal_;
     std::string prevhash_stratum_;

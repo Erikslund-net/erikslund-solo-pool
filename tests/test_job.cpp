@@ -89,6 +89,20 @@ inline std::vector<CoinbaseOut> parse_coinbase_outputs(const Bytes& cb2) {
 
 } // namespace
 
+TEST_CASE("jobs cache a conservative network ceiling without changing display difficulty") {
+    for (const std::string bits : {"1d00ffff", "1b0404cb", "207fffff"}) {
+        CAPTURE(bits);
+        const auto job = make_job(bits);
+        const auto target = target_from_compact(job.bits());
+        const double ceiling = maximum_difficulty_for_target(target);
+        CHECK(job.network_target() == target);
+        CHECK(job.network_difficulty() == difficulty_from_target(target));
+        CHECK(job.maximum_share_difficulty() == ceiling);
+        CHECK(target_from_difficulty(job.maximum_share_difficulty()) >= target);
+        CHECK(job.maximum_share_difficulty() == ceiling);
+    }
+}
+
 TEST_CASE("work_signature is stable for identical work and changes with ntime/txs") {
     const Bytes tag{'/', 'x', '/'};
     const auto base = fixture_json("1d00ffff");

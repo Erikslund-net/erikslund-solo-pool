@@ -95,7 +95,8 @@ public:
     std::shared_ptr<const RuntimeConfig> runtime_config() const override {
         RuntimeConfig config = Config{}.runtime_config();
         config.initial_difficulty = initial_difficulty;
-        config.minimum_difficulty = 1e-12;
+        config.minimum_difficulty = minimum_difficulty;
+        config.maximum_difficulty = maximum_difficulty;
         config.variable_difficulty = vardiff;
         config.vardiff_target_shares_per_minute = 1.0;
         config.vardiff_retarget_seconds = 0;
@@ -111,6 +112,8 @@ public:
     }
     std::shared_ptr<const stratum::Job>
     recent_job(const std::string& job_id) const override {
+        if (retained_job && retained_job->job_id() == job_id)
+            return retained_job;
         return job && job->job_id() == job_id ? job : nullptr;
     }
     void note_accepted_share(const std::string&, const std::string&, double,
@@ -139,8 +142,11 @@ public:
     }
 
     std::shared_ptr<stratum::Job> job;
+    std::shared_ptr<stratum::Job> retained_job;
     size_t extranonce_size = 8;
     double initial_difficulty = 1e-9;
+    double minimum_difficulty = 1e-12;
+    double maximum_difficulty = 0.0;
     bool vardiff = false;
     std::atomic<bool> pause_next_accepted{false};
     std::binary_semaphore accepted_entered{0};
@@ -747,6 +753,7 @@ TEST_CASE("SV2 rejects a Standard Channel until work is available") {
 TEST_CASE("SV2 calibrates the initial target from nominal hashrate") {
     const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
     FakePool pool(now);
+    pool.job = make_job(now, "170fffff");
     pool.vardiff = true;
     FakeConnection connection;
     sv2::Session session(pool, connection, util::from_hex("01020304"));
@@ -766,6 +773,225 @@ TEST_CASE("SV2 calibrates the initial target from nominal hashrate") {
          pool.runtime_config()->vardiff_target_shares_per_minute);
     CHECK(util::uint256::from_le_bytes(opened.target) ==
           util::target_from_difficulty(expected_difficulty));
+}
+
+TEST_CASE("SV2 channel opens never assign a target harder than the network") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    for (const bool extended : {false, true}) {
+        CAPTURE(extended);
+        FakePool pool(now);
+        pool.job = make_job(now, "207fffff");
+        pool.initial_difficulty = 256.0;
+        pool.minimum_difficulty = 128.0;
+        pool.maximum_difficulty = 512.0;
+        FakeConnection connection;
+        sv2::Session session(pool, connection, util::from_hex("01020304"));
+        setup(session, extended ? sv2::kSetupFlagRequiresVersionRolling
+                                : sv2::kSetupFlagRequiresStandardJobs);
+        connection.take_frames();
+        if (extended)
+            open_extended_channel(session);
+        else
+            open_channel(session);
+        const auto frames = connection.take_frames();
+        REQUIRE(frames.size() == 3);
+        const sv2::U256 target = extended
+                                    ? sv2::decode_open_extended_mining_channel_success(
+                                          frames[0].payload).target
+                                    : sv2::decode_open_standard_mining_channel_success(
+                                          frames[0].payload).target;
+        CHECK(util::uint256::from_le_bytes(target) == pool.job->network_target());
+        CHECK(session.authorized());
+        CHECK(session.protocol_errors() == 0);
+    }
+}
+
+TEST_CASE("SV2 live difficulty bounds apply with VarDiff disabled") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now);
+    pool.initial_difficulty = 0.25;
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+    setup(session);
+    connection.take_frames();
+    open_channel(session);
+    connection.take_frames();
+
+    pool.minimum_difficulty = 128.0;
+    session.maybe_retarget();
+    auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].message_type == sv2::SetTarget::kMessageType);
+    CHECK(util::uint256::from_le_bytes(
+              sv2::decode_set_target(frames[0].payload).maximum_target) ==
+          pool.job->network_target());
+
+    pool.minimum_difficulty = 0.125;
+    pool.maximum_difficulty = 0.5;
+    session.maybe_retarget();
+    frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].message_type == sv2::SetTarget::kMessageType);
+    CHECK(util::uint256::from_le_bytes(
+              sv2::decode_set_target(frames[0].payload).maximum_target) ==
+          util::target_from_difficulty(0.5));
+    session.maybe_retarget();
+    CHECK(connection.take_frames().empty());
+}
+
+TEST_CASE("SV2 nominal hashrate updates cannot exceed network difficulty") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now);
+    pool.initial_difficulty = 0.25;
+    pool.vardiff = true;
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+    setup(session);
+    connection.take_frames();
+    open_channel(session, 7, 0.0F);
+    const auto initial = connection.take_frames();
+    const auto opened = sv2::decode_open_standard_mining_channel_success(initial[0].payload);
+
+    session.handle_bytes(sv2::encode_message(sv2::UpdateChannel{
+        opened.channel_id, 200'000'000'000'000.0F, maximum_target()}));
+    const auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].message_type == sv2::SetTarget::kMessageType);
+    CHECK(util::uint256::from_le_bytes(
+              sv2::decode_set_target(frames[0].payload).maximum_target) ==
+          pool.job->network_target());
+}
+
+TEST_CASE("SV2 announces the exact new network ceiling before replacement work") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    for (const bool extended : {false, true}) {
+        CAPTURE(extended);
+        FakePool pool(now);
+        pool.job = make_job(now, "170fffff");
+        pool.initial_difficulty = 256.0;
+        FakeConnection connection;
+        sv2::Session session(pool, connection, util::from_hex("01020304"));
+        setup(session, extended ? sv2::kSetupFlagRequiresVersionRolling
+                                : sv2::kSetupFlagRequiresStandardJobs);
+        connection.take_frames();
+        if (extended)
+            open_extended_channel(session);
+        else
+            open_channel(session);
+        connection.take_frames();
+
+        pool.job = make_job(now, "207fffff");
+        session.publish_job(*pool.job, true);
+        const auto frames = connection.take_frames();
+        REQUIRE(frames.size() == (extended ? 3 : 4));
+        REQUIRE(frames[0].message_type == sv2::SetTarget::kMessageType);
+        CHECK(util::uint256::from_le_bytes(
+                  sv2::decode_set_target(frames[0].payload).maximum_target) ==
+              pool.job->network_target());
+        CHECK(frames[frames.size() - 2].message_type ==
+              (extended ? sv2::NewExtendedMiningJob::kMessageType
+                        : sv2::NewMiningJob::kMessageType));
+        CHECK(frames.back().message_type == sv2::SetNewPrevHash::kMessageType);
+    }
+}
+
+TEST_CASE("SV2 uses the advertised job ceiling rather than a newer unpublished template") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now);
+    pool.job = make_job(now, "207fffff");
+    pool.initial_difficulty = 256.0;
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+    setup(session);
+    connection.take_frames();
+    open_channel(session);
+    connection.take_frames();
+
+    pool.retained_job = pool.job;
+    pool.job = make_job(now, "170fffff");
+    pool.minimum_difficulty = 128.0;
+    session.maybe_retarget();
+    CHECK(connection.take_frames().empty());
+    session.publish_job(*pool.retained_job, false);
+    const auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0].message_type == sv2::SetExtranoncePrefix::kMessageType);
+    CHECK(frames[1].message_type == sv2::NewMiningJob::kMessageType);
+    CHECK(session.stats().difficulty ==
+          util::difficulty_from_target(pool.retained_job->network_target()));
+}
+
+TEST_CASE("SV2 refuses incompatible device targets without closing the transport") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now);
+    pool.initial_difficulty = 0.25;
+    const sv2::U256 incompatible_target = util::target_from_difficulty(2.0).le_bytes();
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+    setup(session);
+    connection.take_frames();
+    session.handle_bytes(sv2::encode_message(sv2::OpenStandardMiningChannel{
+        7, "validaddr.rig", 0.0F, incompatible_target}));
+    auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].message_type == sv2::OpenMiningChannelError::kMessageType);
+    CHECK(sv2::decode_open_mining_channel_error(frames[0].payload).error_code ==
+          "unsupported-target");
+    CHECK_FALSE(session.authorized());
+    CHECK_FALSE(session.should_close());
+    CHECK(session.protocol_errors() == 0);
+
+    open_channel(session);
+    const auto initial = connection.take_frames();
+    REQUIRE(initial.size() == 3);
+    const auto opened = sv2::decode_open_standard_mining_channel_success(initial[0].payload);
+    session.handle_bytes(sv2::encode_message(sv2::UpdateChannel{
+        opened.channel_id, 0.0F, incompatible_target}));
+    frames = connection.take_frames();
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].message_type == sv2::UpdateChannelError::kMessageType);
+    CHECK(sv2::decode_update_channel_error(frames[0].payload).error_code ==
+          "unsupported-target");
+    CHECK(session.stats().difficulty == util::difficulty_from_target(
+              util::uint256::from_le_bytes(opened.target)));
+    CHECK(session.authorized());
+    CHECK_FALSE(session.should_close());
+    CHECK(session.protocol_errors() == 0);
+}
+
+TEST_CASE("SV2 closes only incompatible channels when the network target becomes easier") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool(now);
+    const sv2::U256 device_target = util::target_from_difficulty(0.5).le_bytes();
+    FakeConnection connection;
+    sv2::Session session(pool, connection, util::from_hex("01020304"));
+    setup(session, sv2::kSetupFlagRequiresVersionRolling);
+    connection.take_frames();
+    session.handle_bytes(sv2::encode_message(sv2::OpenExtendedMiningChannel{
+        7, "validaddr.a", 0.0F, device_target, 6}));
+    const auto first = connection.take_frames();
+    REQUIRE(first.size() == 3);
+    const auto restricted = sv2::decode_open_extended_mining_channel_success(first[0].payload);
+    open_extended_channel(session, 8, 0.0F, 6, "otheraddr.b");
+    connection.take_frames();
+
+    pool.job = make_job(now, "207fffff");
+    session.publish_job(*pool.job, true);
+    const auto frames = connection.take_frames();
+    REQUIRE(frames.size() == 4);
+    REQUIRE(frames[0].message_type == sv2::CloseChannel::kMessageType);
+    const auto closed = sv2::decode_close_channel(frames[0].payload);
+    CHECK(closed.channel_id == restricted.channel_id);
+    CHECK(closed.reason_code == "unsupported-target");
+    CHECK(frames[1].message_type == sv2::SetTarget::kMessageType);
+    CHECK(frames[2].message_type == sv2::NewExtendedMiningJob::kMessageType);
+    CHECK(frames[3].message_type == sv2::SetNewPrevHash::kMessageType);
+    const auto snapshot = session.stats();
+    REQUIRE(snapshot.channels.size() == 1);
+    CHECK(snapshot.channels[0].worker == "b");
+    CHECK(session.authorized());
+    CHECK_FALSE(session.should_close());
+    CHECK(session.protocol_errors() == 0);
 }
 
 TEST_CASE("SV2 retargets every open Extended Channel") {
@@ -1063,7 +1289,7 @@ TEST_CASE("SV2 hands off a block once and rejects its duplicate") {
     REQUIRE(frames.size() == 1);
     CHECK(frames[0].message_type == sv2::SubmitSharesSuccess::kMessageType);
     CHECK(sv2::decode_submit_shares_success(frames[0].payload)
-              .new_shares_sum == 3);
+              .new_shares_sum == 1);
     CHECK(pool.accepted == 1);
     CHECK(pool.blocks == 1);
     CHECK(pool.block_address == "validaddr");

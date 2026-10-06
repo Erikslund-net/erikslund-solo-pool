@@ -110,12 +110,12 @@
     "minimum_difficulty": {
       "type": "number",
       "exclusiveMinimum": 0,
-      "description": "Lowest difficulty variable_difficulty will drop a client to. Default 0.001."
+      "description": "Share difficulty floor. The job's network ceiling takes precedence if lower. Default 0.001."
     },
     "maximum_difficulty": {
       "type": "number",
       "minimum": 0,
-      "description": "Highest difficulty variable_difficulty will raise a client to (0 = no maximum). Default 0."
+      "description": "Operator share difficulty ceiling (0 = network ceiling only). Default 0."
     },
     "variable_difficulty": {
       "type": "boolean",

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <format>
 #include <functional>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bitcoin/block_template.hpp"
@@ -24,7 +26,7 @@ using namespace erikslund::test;
 using json = glz::generic;
 
 namespace erikslund::stratum {
-// Test-only window into Session's dedup and control-rate state.
+// Test-only window into Session's dedup, control-rate, and retarget timing state.
 struct SessionTestPeek {
     static bool remember(Session& s, std::string key) { return s.remember(std::move(key)); }
     static size_t current_size(const Session& s) { return s.seen_shares_current_.size(); }
@@ -37,6 +39,26 @@ struct SessionTestPeek {
     static void freeze_control_refill(Session& session) {
         session.control_refill_at_ = std::chrono::steady_clock::time_point::max();
     }
+    static void set_retarget_window(Session& session, uint64_t shares) {
+        constexpr double kElapsedSeconds = 120.0;
+        session.last_retarget_ = stats::steady_seconds() - kElapsedSeconds;
+        session.shares_since_retarget_ = shares;
+    }
+    static double set_fixed_share_window(Session& session, double elapsed, uint64_t accepted) {
+        const double now = stats::steady_seconds();
+        session.fixed_share_window_started_ = now - elapsed;
+        session.fixed_shares_in_window_ = accepted;
+        return now;
+    }
+    static auto fixed_share_window(const Session& session) {
+        return std::pair{session.fixed_share_window_started_, session.fixed_shares_in_window_};
+    }
+    static double fixed_difficulty_floor(const Session& session) {
+        return session.fixed_difficulty_floor_;
+    }
+    static void evaluate_fixed_share_window(Session& session, double now) {
+        session.maybe_raise_fixed_difficulty(now);
+    }
 };
 } // namespace erikslund::stratum
 
@@ -45,12 +67,13 @@ namespace {
 const Bytes kPayoutScript = util::from_hex("0014751e76e8199196d454941c45d1b3a323f1433bd6");
 const Bytes kOtherPayoutScript = util::from_hex("00140000000000000000000000000000000000000001");
 
-std::shared_ptr<Job> make_fake_job(uint32_t curtime, uint32_t version = 0x20000000) {
+std::shared_ptr<Job> make_fake_job(uint32_t curtime, uint32_t version = 0x20000000,
+                                 std::string_view bits = "01010000") {
     gbt_json t = gbt_json::object_t{};
     t["height"] = 200;
     t["version"] = version;
     t["curtime"] = curtime;
-    t["bits"] = std::string("207fffff"); // regtest-easy, so a share is cheap to accept
+    t["bits"] = std::string(bits);
     t["coinbasevalue"] = 5000000000LL;
     t["previousblockhash"] = std::string(64, '0');
     t["transactions"] = gbt_json::array_t{};
@@ -97,15 +120,17 @@ public:
     bool block_found = false;
     std::function<void()> block_found_hook;
     bool vardiff = false;
-    double minimum_difficulty = 0.001;
+    double initial_difficulty = 1e-9;
+    double minimum_difficulty = 1e-12;
     double maximum_difficulty = 0.0;
 
-    explicit FakePool(uint32_t curtime) : job(make_fake_job(curtime)) {}
+    explicit FakePool(uint32_t curtime, bool easy_blocks = false)
+        : job(make_fake_job(curtime, 0x20000000, easy_blocks ? "207fffff" : "01010000")) {}
 
     size_t extranonce2_size() const override { return 4; }
     std::shared_ptr<const RuntimeConfig> runtime_config() const override {
         Config config;
-        config.initial_difficulty = 1e-9;
+        config.initial_difficulty = initial_difficulty;
         config.minimum_difficulty = minimum_difficulty;
         config.maximum_difficulty = maximum_difficulty;
         config.variable_difficulty = vardiff;
@@ -150,7 +175,7 @@ public:
     uint32_t version_mask() const override { return 0x1fffe000u; }
 };
 
-// Find a nonce whose share is accepted (the regtest-easy target accepts ~half).
+// Tiny share difficulties and regtest block targets both make nonce search cheap.
 std::string find_accepted_nonce(const Job& job, const Bytes& enonce1, double difficulty,
                                 bool require_block = false) {
     const Bytes coinbase2 = job.build_coinbase2(kPayoutScript);
@@ -173,9 +198,11 @@ std::string find_accepted_nonce(const Job& job, const Bytes& enonce1, double dif
 
 struct Fixture {
     uint32_t curtime = static_cast<uint32_t>(std::time(nullptr));
-    FakePool pool{curtime};
+    FakePool pool;
     FakeConnection conn;
     Session session{pool, conn, util::from_hex("e06ae06a")};
+
+    explicit Fixture(bool easy_blocks = false) : pool(curtime, easy_blocks) {}
 
     void subscribe() {
         session.handle_line(R"({"id":1,"method":"mining.subscribe","params":["miner/1.0"]})");
@@ -283,6 +310,805 @@ TEST_CASE("authorize ignores malformed password difficulty") {
     fixture.authorize("validaddr.worker1", "d=1000oops");
 
     CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty));
+}
+
+TEST_CASE("password difficulty tokens remain fixed at high and low share rates") {
+    constexpr uint64_t kHighShareCount = 128;
+    for (const std::string_view password : {"d=64", "diff=64", "diff_64"}) {
+        CAPTURE(password);
+        Fixture fixture;
+        fixture.pool.vardiff = true;
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", password);
+        REQUIRE(fixture.session.difficulty() == doctest::Approx(64.0));
+
+        for (const uint64_t shares : {kHighShareCount, uint64_t{0}}) {
+            fixture.conn.sent.clear();
+            SessionTestPeek::set_retarget_window(fixture.session, shares);
+            fixture.session.maybe_retarget();
+            CHECK(fixture.session.difficulty() == doctest::Approx(64.0));
+            CHECK(fixture.conn.sent.empty());
+        }
+    }
+}
+
+TEST_CASE("a password difficulty equal to the current value still disables VarDiff") {
+    Fixture fixture;
+    fixture.pool.vardiff = true;
+    fixture.subscribe();
+    const double initial_difficulty = fixture.session.difficulty();
+    const double before_authorize = stats::steady_seconds();
+    fixture.authorize("validaddr.worker", std::format("d={}", initial_difficulty));
+    const auto window = SessionTestPeek::fixed_share_window(fixture.session);
+    CHECK(window.first >= before_authorize);
+    CHECK(window.second == 0);
+
+    fixture.conn.sent.clear();
+    SessionTestPeek::set_retarget_window(fixture.session, 128);
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty));
+    CHECK(fixture.conn.sent.empty());
+}
+
+TEST_CASE("password difficulty remains fixed after clamping at either configured bound") {
+    for (const std::string_view prefix : {"d=", "diff=", "diff_"}) {
+        CAPTURE(prefix);
+        for (const double requested : {1.0, 1'000.0}) {
+            CAPTURE(requested);
+            Fixture fixture;
+            fixture.pool.vardiff = true;
+            fixture.pool.minimum_difficulty = 10.0;
+            fixture.pool.maximum_difficulty = 100.0;
+            fixture.subscribe();
+            fixture.authorize("validaddr.worker", std::format("{}{}", prefix, requested));
+            const double expected = std::clamp(requested, 10.0, 100.0);
+            REQUIRE(fixture.session.difficulty() == doctest::Approx(expected));
+            const auto difficulty = fixture.conn.by_method("mining.set_difficulty");
+            REQUIRE(difficulty.has_value());
+            CHECK((*difficulty)["params"][0].get<double>() == doctest::Approx(expected));
+
+            for (const uint64_t shares : {uint64_t{128}, uint64_t{0}}) {
+                fixture.conn.sent.clear();
+                SessionTestPeek::set_retarget_window(fixture.session, shares);
+                fixture.session.maybe_retarget();
+                CHECK(fixture.session.difficulty() == doctest::Approx(expected));
+                CHECK(fixture.conn.sent.empty());
+            }
+        }
+    }
+}
+
+TEST_CASE("fixed reauthorization clamps low password tokens to the reloaded minimum") {
+    for (const std::string_view password : {"d=1", "diff=1", "diff_1"}) {
+        CAPTURE(password);
+        for (const bool vardiff : {false, true}) {
+            CAPTURE(vardiff);
+            Fixture fixture;
+            fixture.pool.vardiff = vardiff;
+            fixture.subscribe();
+            fixture.authorize("validaddr.worker", "d=64");
+            fixture.pool.minimum_difficulty = 200.0;
+            fixture.conn.sent.clear();
+
+            fixture.authorize("validaddr.worker", password);
+
+            CHECK(fixture.session.difficulty() == doctest::Approx(200.0));
+            const auto difficulty = fixture.conn.by_method("mining.set_difficulty");
+            REQUIRE(difficulty.has_value());
+            CHECK((*difficulty)["params"][0].get<double>() == doctest::Approx(200.0));
+            fixture.conn.sent.clear();
+            SessionTestPeek::set_retarget_window(fixture.session, 0);
+            fixture.session.maybe_retarget();
+            CHECK(fixture.session.difficulty() == doctest::Approx(200.0));
+            CHECK(fixture.conn.sent.empty());
+        }
+    }
+}
+
+TEST_CASE("difficulty announcements respect a reloaded minimum before the retarget tick") {
+    for (const std::string_view operation : {"tokenless reauthorization",
+                                             "malformed reauthorization", "resubscribe",
+                                             "set difficulty"}) {
+        CAPTURE(operation);
+        for (const bool fixed : {false, true}) {
+            CAPTURE(fixed);
+            Fixture fixture;
+            fixture.subscribe();
+            fixture.authorize("validaddr.worker", fixed ? "d=64" : "x");
+            const double previous_difficulty = fixture.session.difficulty();
+            fixture.pool.minimum_difficulty = 200.0;
+            fixture.conn.sent.clear();
+
+            if (operation == "tokenless reauthorization")
+                fixture.authorize("validaddr.worker", "x");
+            else if (operation == "malformed reauthorization")
+                fixture.authorize("validaddr.worker", "d=oops");
+            else if (operation == "resubscribe")
+                fixture.subscribe();
+            else
+                fixture.session.send_set_difficulty();
+
+            CHECK(fixture.session.difficulty() == doctest::Approx(200.0));
+            const auto difficulty = fixture.conn.by_method("mining.set_difficulty");
+            REQUIRE(difficulty.has_value());
+            CHECK((*difficulty)["params"][0].get<double>() == doctest::Approx(200.0));
+            fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "207fffff");
+            const auto nonce = find_accepted_nonce(
+                *fixture.pool.job, util::from_hex(fixture.session.extranonce1_hex()),
+                previous_difficulty, true);
+            REQUIRE_FALSE(nonce.empty());
+            fixture.submit(9, nonce);
+            CHECK(fixture.pool.block_found);
+            CHECK(fixture.pool.last_share_difficulty ==
+                  doctest::Approx(operation == "set difficulty" ? previous_difficulty : 200.0));
+        }
+    }
+}
+
+TEST_CASE("passwords without a valid difficulty leave VarDiff and suggestions enabled") {
+    for (const std::string_view password : {"", "x", "d=oops", "d=0", "d=-1", "d=nan",
+                                           "diff=inf", "diff_1e9999", "d=64oops"}) {
+        CAPTURE(password);
+        Fixture fixture;
+        fixture.pool.vardiff = true;
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", password);
+        const double initial_difficulty = fixture.session.difficulty();
+
+        SessionTestPeek::set_retarget_window(fixture.session, 128);
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty * 2.0));
+
+        fixture.conn.sent.clear();
+        fixture.session.handle_line(
+            R"({"id":9,"method":"mining.suggest_difficulty","params":[64]})");
+        const auto reply = fixture.conn.by_id(9);
+        REQUIRE(reply.has_value());
+        CHECK((*reply)["result"].get<bool>());
+        CHECK(fixture.session.difficulty() == doctest::Approx(64.0));
+        CHECK(fixture.conn.by_method("mining.set_difficulty").has_value());
+
+        SessionTestPeek::set_retarget_window(fixture.session, 0);
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == doctest::Approx(32.0));
+    }
+}
+
+TEST_CASE("authorization without a password leaves VarDiff enabled") {
+    Fixture fixture;
+    fixture.pool.vardiff = true;
+    fixture.subscribe();
+    fixture.session.handle_line(
+        R"({"id":3,"method":"mining.authorize","params":["validaddr.worker"]})");
+    REQUIRE(fixture.session.authorized());
+    const double initial_difficulty = fixture.session.difficulty();
+
+    SessionTestPeek::set_retarget_window(fixture.session, 128);
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty * 2.0));
+}
+
+TEST_CASE("fixed password difficulty acknowledges but ignores later suggestions") {
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=64");
+    fixture.conn.sent.clear();
+
+    fixture.session.handle_line(
+        R"({"id":9,"method":"mining.suggest_difficulty","params":[128]})");
+    const auto reply = fixture.conn.by_id(9);
+    REQUIRE(reply.has_value());
+    CHECK((*reply)["result"].get<bool>());
+    CHECK(fixture.session.difficulty() == doctest::Approx(64.0));
+    CHECK_FALSE(fixture.conn.by_method("mining.set_difficulty").has_value());
+    CHECK_FALSE(fixture.conn.by_method("mining.notify").has_value());
+}
+
+TEST_CASE("fixed password difficulty still hands off a block below the share difficulty") {
+    constexpr double kFixedDifficulty = 1'000'000.0;
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=1000000");
+    fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "207fffff");
+    const std::string nonce = find_accepted_nonce(
+        *fixture.pool.job, util::from_hex(fixture.session.extranonce1_hex()), kFixedDifficulty,
+        /*require_block=*/true);
+    REQUIRE_FALSE(nonce.empty());
+
+    fixture.submit(9, nonce);
+    const auto reply = fixture.conn.by_id(9);
+    REQUIRE(reply.has_value());
+    CHECK((*reply)["result"].get<bool>());
+    CHECK(fixture.pool.block_found);
+    CHECK(fixture.pool.accepted == 1);
+    CHECK(fixture.pool.last_share_difficulty == doctest::Approx(kFixedDifficulty));
+    CHECK(fixture.pool.last_share_best < kFixedDifficulty);
+}
+
+TEST_CASE("same-address reauthorization updates fixed difficulty and preserves it without a token") {
+    Fixture fixture;
+    fixture.pool.vardiff = true;
+    fixture.subscribe();
+    fixture.authorize("validaddr.original", "d=64");
+    fixture.conn.sent.clear();
+    fixture.authorize("validaddr.updated", "diff=128");
+    REQUIRE(fixture.session.difficulty() == doctest::Approx(128.0));
+    const auto updated = fixture.conn.by_method("mining.set_difficulty");
+    REQUIRE(updated.has_value());
+    CHECK((*updated)["params"][0].get<double>() == doctest::Approx(128.0));
+
+    for (const std::string_view password : {"x", "", "d=oops", "d=0", "diff=-5", "diff_inf"}) {
+        CAPTURE(password);
+        fixture.conn.sent.clear();
+        fixture.authorize("validaddr.rebound", password);
+        const auto reply = fixture.conn.by_id(3);
+        REQUIRE(reply.has_value());
+        CHECK((*reply)["result"].get<bool>());
+        CHECK(fixture.session.difficulty() == doctest::Approx(128.0));
+
+        fixture.conn.sent.clear();
+        SessionTestPeek::set_retarget_window(fixture.session, 0);
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == doctest::Approx(128.0));
+        CHECK(fixture.conn.sent.empty());
+    }
+}
+
+TEST_CASE("failed initial authorization cannot enable fixed difficulty") {
+    Fixture fixture;
+    fixture.pool.vardiff = true;
+    fixture.subscribe();
+    const double initial_difficulty = fixture.session.difficulty();
+    fixture.authorize("badaddr.worker", "d=128");
+    const auto refused = fixture.conn.by_id(3);
+    REQUIRE(refused.has_value());
+    CHECK_FALSE((*refused)["result"].get<bool>());
+    CHECK_FALSE(fixture.session.authorized());
+    CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty));
+
+    fixture.authorize("validaddr.worker");
+    SessionTestPeek::set_retarget_window(fixture.session, 128);
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty * 2.0));
+}
+
+TEST_CASE("refused reauthorization preserves the existing difficulty mode") {
+    for (const bool fixed : {false, true}) {
+        CAPTURE(fixed);
+        Fixture fixture;
+        fixture.pool.vardiff = true;
+        fixture.subscribe();
+        fixture.session.handle_line(
+            R"({"id":9,"method":"mining.suggest_difficulty","params":[64]})");
+        fixture.authorize("validaddr.worker", fixed ? "d=64" : "x");
+        REQUIRE(fixture.session.difficulty() == doctest::Approx(64.0));
+
+        fixture.conn.sent.clear();
+        fixture.authorize("othervalidaddr.worker", "d=128");
+        const auto refused = fixture.conn.by_id(3);
+        REQUIRE(refused.has_value());
+        CHECK_FALSE((*refused)["result"].get<bool>());
+        CHECK(fixture.session.difficulty() == doctest::Approx(64.0));
+        CHECK(fixture.session.address() == "validaddr");
+
+        SessionTestPeek::set_retarget_window(fixture.session, 0);
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == doctest::Approx(fixed ? 64.0 : 32.0));
+    }
+}
+
+TEST_CASE("fixed password difficulty follows live bounds even with global VarDiff disabled") {
+    for (const bool vardiff : {false, true}) {
+        CAPTURE(vardiff);
+        Fixture fixture;
+        fixture.pool.vardiff = vardiff;
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", "d=64");
+        REQUIRE(fixture.session.difficulty() == doctest::Approx(64.0));
+
+        fixture.pool.minimum_difficulty = 100.0;
+        fixture.conn.sent.clear();
+        SessionTestPeek::set_retarget_window(fixture.session, 0);
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == doctest::Approx(100.0));
+        const auto raised = fixture.conn.by_method("mining.set_difficulty");
+        REQUIRE(raised.has_value());
+        CHECK((*raised)["params"][0].get<double>() == doctest::Approx(100.0));
+
+        fixture.pool.minimum_difficulty = 1.0;
+        fixture.pool.maximum_difficulty = 32.0;
+        fixture.conn.sent.clear();
+        SessionTestPeek::set_retarget_window(fixture.session, 128);
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == doctest::Approx(32.0));
+        const auto lowered = fixture.conn.by_method("mining.set_difficulty");
+        REQUIRE(lowered.has_value());
+        CHECK((*lowered)["params"][0].get<double>() == doctest::Approx(32.0));
+
+        fixture.pool.maximum_difficulty = 0.0;
+        fixture.conn.sent.clear();
+        SessionTestPeek::set_retarget_window(fixture.session, 128);
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == doctest::Approx(32.0));
+        CHECK(fixture.conn.sent.empty());
+    }
+}
+
+TEST_CASE("fixed share windows allow short bursts and raise only above sixty shares per minute") {
+    struct WindowCase {
+        double elapsed;
+        uint64_t accepted;
+        double expected_difficulty;
+        uint64_t expected_count;
+    };
+    for (const auto& window : {WindowCase{10.0, 100, 64.0, 101},
+                               WindowCase{60.0, 59, 64.0, 0},
+                               WindowCase{120.0, 60, 64.0, 0},
+                               WindowCase{60.0, 60, 64.0 * 61.0 / 30.0, 0},
+                               WindowCase{120.0, 120, 64.0 * 121.0 / 60.0, 0}}) {
+        CAPTURE(window.elapsed);
+        CAPTURE(window.accepted);
+        Fixture fixture;
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", "d=64");
+        fixture.conn.sent.clear();
+        const double now = SessionTestPeek::set_fixed_share_window(
+            fixture.session, window.elapsed, window.accepted);
+        const auto before = SessionTestPeek::fixed_share_window(fixture.session);
+
+        SessionTestPeek::evaluate_fixed_share_window(fixture.session, now);
+
+        CHECK(fixture.session.difficulty() == doctest::Approx(window.expected_difficulty));
+        const auto after = SessionTestPeek::fixed_share_window(fixture.session);
+        CHECK(after.second == window.expected_count);
+        CHECK(after.first == (window.elapsed < 60.0 ? before.first : now));
+        if (window.expected_difficulty > 64.0) {
+            CHECK(SessionTestPeek::fixed_difficulty_floor(fixture.session) ==
+                  doctest::Approx(window.expected_difficulty));
+            CHECK(fixture.conn.by_method("mining.set_difficulty").has_value());
+            CHECK(fixture.conn.by_method("mining.notify").has_value());
+        } else {
+            CHECK(fixture.conn.sent.empty());
+        }
+    }
+}
+
+TEST_CASE("fixed share rate increases follow block handoff and acknowledgement before new work") {
+    constexpr double kInitialDifficulty = 3e-10;
+    for (const bool vardiff : {false, true}) {
+        CAPTURE(vardiff);
+        Fixture fixture{true};
+        fixture.pool.vardiff = vardiff;
+        fixture.pool.job->set_publication_sequence(1);
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", std::format("d={}", kInitialDifficulty));
+        const std::string nonce = find_accepted_nonce(
+            *fixture.pool.job, util::from_hex(fixture.session.extranonce1_hex()),
+            kInitialDifficulty, true);
+        REQUIRE_FALSE(nonce.empty());
+        fixture.conn.sent.clear();
+        SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 60);
+        fixture.pool.block_found_hook = [&] {
+            CHECK(fixture.session.difficulty() == kInitialDifficulty);
+            CHECK_FALSE(fixture.conn.by_id(9).has_value());
+            CHECK(fixture.conn.sent.empty());
+        };
+
+        fixture.submit(9, nonce);
+
+        CHECK(fixture.pool.block_found);
+        CHECK(fixture.pool.accepted == 1);
+        CHECK(fixture.pool.last_share_difficulty == kInitialDifficulty);
+        CHECK(fixture.session.difficulty() > kInitialDifficulty);
+        CHECK(fixture.session.difficulty() == fixture.pool.job->maximum_share_difficulty());
+        REQUIRE(fixture.conn.sent.size() == 3);
+        CHECK(fixture.conn.sent[0]["id"].get<double>() == 9.0);
+        CHECK(fixture.conn.sent[0]["result"].get<bool>());
+        CHECK(fixture.conn.sent[1]["method"].get<std::string>() == "mining.set_difficulty");
+        CHECK(fixture.conn.sent[1]["params"][0].get<double>() == fixture.session.difficulty());
+        CHECK(fixture.conn.sent[2]["method"].get<std::string>() == "mining.notify");
+        CHECK(fixture.conn.sent[2]["params"][8].get<bool>());
+        CHECK(SessionTestPeek::fixed_share_window(fixture.session).second == 0);
+    }
+}
+
+TEST_CASE("rejected submissions do not count toward the fixed share rate") {
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=64");
+    fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "207fffff");
+    const Bytes extranonce1 = util::from_hex(fixture.session.extranonce1_hex());
+    const std::string accepted_nonce =
+        find_accepted_nonce(*fixture.pool.job, extranonce1, 64.0, true);
+    REQUIRE_FALSE(accepted_nonce.empty());
+    fixture.submit(9, accepted_nonce);
+    REQUIRE(fixture.pool.accepted == 1);
+
+    const Bytes coinbase2 = fixture.pool.job->build_coinbase2(kPayoutScript);
+    const std::string ntime = fixture.pool.job->ntime_hex();
+    std::string rejected_nonce;
+    for (uint32_t nonce = 0; nonce < 512; ++nonce) {
+        const std::string nonce_hex = std::format("{:08x}", nonce);
+        const auto result = fixture.pool.job->validate_share(
+            {coinbase2, extranonce1, "01020304", ntime, nonce_hex,
+             util::target_from_difficulty(64.0), std::nullopt, 0,
+             static_cast<int64_t>(std::time(nullptr))});
+        if (!result && result.error().reason == ShareReject::AboveTarget) {
+            rejected_nonce = nonce_hex;
+            break;
+        }
+    }
+    REQUIRE_FALSE(rejected_nonce.empty());
+    SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 60);
+    const auto window = SessionTestPeek::fixed_share_window(fixture.session);
+    fixture.conn.sent.clear();
+
+    fixture.submit(10, accepted_nonce);
+    fixture.submit(11, rejected_nonce);
+    fixture.submit(12, "oops");
+    fixture.session.handle_line(
+        R"({"id":13,"method":"mining.submit","params":["w","missing","01020304","00000000","00000000"]})");
+
+    CHECK(fixture.pool.accepted == 1);
+    CHECK(fixture.pool.rejected == 4);
+    CHECK(SessionTestPeek::fixed_share_window(fixture.session) == window);
+    CHECK(fixture.session.difficulty() == doctest::Approx(64.0));
+    CHECK_FALSE(fixture.conn.by_method("mining.set_difficulty").has_value());
+    CHECK_FALSE(fixture.conn.by_method("mining.notify").has_value());
+}
+
+TEST_CASE("reauthorization preserves the fixed rate window and its raised floor") {
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=64");
+    const double now = SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 89);
+    SessionTestPeek::evaluate_fixed_share_window(fixture.session, now);
+    REQUIRE(fixture.session.difficulty() == doctest::Approx(192.0));
+    SessionTestPeek::set_fixed_share_window(fixture.session, 30.0, 17);
+    const auto window = SessionTestPeek::fixed_share_window(fixture.session);
+
+    struct AuthorizationCase {
+        std::string_view user;
+        std::string_view password;
+        double expected_difficulty;
+        bool accepted;
+    };
+    for (const auto& authorization : {
+             AuthorizationCase{"validaddr.worker", "x", 192.0, true},
+             AuthorizationCase{"validaddr.rebound", "d=256", 256.0, true},
+             AuthorizationCase{"validaddr.rebound", "d=oops", 256.0, true},
+             AuthorizationCase{"validaddr.rebound", "d=1", 192.0, true},
+             AuthorizationCase{"othervalidaddr.worker", "d=1", 192.0, false}}) {
+        CAPTURE(authorization.user);
+        CAPTURE(authorization.password);
+        fixture.conn.sent.clear();
+        fixture.authorize(std::string(authorization.user), authorization.password);
+        const auto reply = fixture.conn.by_id(3);
+        REQUIRE(reply.has_value());
+        CHECK((*reply)["result"].get<bool>() == authorization.accepted);
+        CHECK(fixture.session.difficulty() == doctest::Approx(authorization.expected_difficulty));
+        CHECK(SessionTestPeek::fixed_share_window(fixture.session) == window);
+        CHECK(SessionTestPeek::fixed_difficulty_floor(fixture.session) == doctest::Approx(192.0));
+    }
+
+    fixture.session.handle_line(
+        R"({"id":14,"method":"mining.authorize","params":["validaddr.worker"]})");
+    CHECK(SessionTestPeek::fixed_share_window(fixture.session) == window);
+    fixture.conn.sent.clear();
+    const double quiet_now = SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 0);
+    SessionTestPeek::evaluate_fixed_share_window(fixture.session, quiet_now);
+    CHECK(fixture.session.difficulty() == doctest::Approx(192.0));
+    CHECK(fixture.conn.sent.empty());
+}
+
+TEST_CASE("fixed rate increases honor freshly reloaded difficulty bounds") {
+    struct BoundsCase {
+        double minimum;
+        double maximum;
+        double expected;
+    };
+    for (const auto& bounds : {BoundsCase{0.001, 100.0, 100.0},
+                               BoundsCase{200.0, 500.0, 200.0},
+                               BoundsCase{0.001, 64.0, 64.0}}) {
+        CAPTURE(bounds.minimum);
+        CAPTURE(bounds.maximum);
+        Fixture fixture;
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", "d=64");
+        fixture.pool.minimum_difficulty = bounds.minimum;
+        fixture.pool.maximum_difficulty = bounds.maximum;
+        const double now = SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 60);
+        SessionTestPeek::evaluate_fixed_share_window(fixture.session, now);
+        CHECK(fixture.session.difficulty() == doctest::Approx(bounds.expected));
+    }
+}
+
+TEST_CASE("operator maximum can temporarily override a fixed rate floor without erasing it") {
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=64");
+    fixture.pool.maximum_difficulty = 100.0;
+    const double now = SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 60);
+    SessionTestPeek::evaluate_fixed_share_window(fixture.session, now);
+    REQUIRE(fixture.session.difficulty() == doctest::Approx(100.0));
+
+    fixture.pool.maximum_difficulty = 32.0;
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == doctest::Approx(32.0));
+    CHECK(SessionTestPeek::fixed_difficulty_floor(fixture.session) == doctest::Approx(100.0));
+    fixture.authorize("validaddr.worker", "d=1");
+    CHECK(fixture.session.difficulty() == doctest::Approx(32.0));
+
+    fixture.pool.maximum_difficulty = 0.0;
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == doctest::Approx(100.0));
+    fixture.authorize("validaddr.worker", "d=1");
+    CHECK(fixture.session.difficulty() == doctest::Approx(100.0));
+}
+
+TEST_CASE("fixed rate counters and difficulty scaling saturate without overflow") {
+    FakePool pool{static_cast<uint32_t>(std::time(nullptr))};
+    pool.job.reset();
+    FakeConnection connection;
+    Session session{pool, connection, util::from_hex("e06ae06a")};
+    session.handle_line(R"({"id":1,"method":"mining.subscribe","params":[]})");
+    session.handle_line(
+        R"({"id":3,"method":"mining.authorize","params":["validaddr.worker","d=1e308"]})");
+    REQUIRE(session.difficulty() == 1e308);
+    constexpr uint64_t kMaximumShareCount = std::numeric_limits<uint64_t>::max();
+    const double burst_now =
+        SessionTestPeek::set_fixed_share_window(session, 10.0, kMaximumShareCount);
+    SessionTestPeek::evaluate_fixed_share_window(session, burst_now);
+    CHECK(SessionTestPeek::fixed_share_window(session).second == kMaximumShareCount);
+    CHECK(session.difficulty() == 1e308);
+
+    const double completed_now =
+        SessionTestPeek::set_fixed_share_window(session, 60.0, kMaximumShareCount);
+    SessionTestPeek::evaluate_fixed_share_window(session, completed_now);
+    CHECK(std::isfinite(session.difficulty()));
+    CHECK(session.difficulty() == std::numeric_limits<double>::max());
+    CHECK(SessionTestPeek::fixed_share_window(session).second == 0);
+}
+
+TEST_CASE("a reconnect starts with a fresh fixed share window and no raised floor") {
+    Fixture original;
+    original.subscribe();
+    original.authorize("validaddr.worker", "d=64");
+    const double now = SessionTestPeek::set_fixed_share_window(original.session, 60.0, 89);
+    SessionTestPeek::evaluate_fixed_share_window(original.session, now);
+    REQUIRE(SessionTestPeek::fixed_difficulty_floor(original.session) == doctest::Approx(192.0));
+
+    Fixture reconnected;
+    reconnected.subscribe();
+    reconnected.authorize("validaddr.worker", "d=1");
+    CHECK(reconnected.session.difficulty() == doctest::Approx(1.0));
+    CHECK(SessionTestPeek::fixed_difficulty_floor(reconnected.session) == 0.0);
+    const auto window = SessionTestPeek::fixed_share_window(reconnected.session);
+    CHECK(window.first >= now);
+    CHECK(window.second == 0);
+}
+
+TEST_CASE("accepted shares leave ordinary VarDiff sessions outside the fixed rate safeguard") {
+    Fixture fixture;
+    fixture.pool.vardiff = true;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker");
+    const double initial_difficulty = fixture.session.difficulty();
+    const std::string nonce = find_accepted_nonce(
+        *fixture.pool.job, util::from_hex(fixture.session.extranonce1_hex()), initial_difficulty);
+    REQUIRE_FALSE(nonce.empty());
+    fixture.conn.sent.clear();
+    fixture.submit(9, nonce);
+
+    CHECK(fixture.pool.accepted == 1);
+    CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty));
+    CHECK(SessionTestPeek::fixed_share_window(fixture.session).first == 0.0);
+    CHECK(SessionTestPeek::fixed_share_window(fixture.session).second == 0);
+    CHECK(SessionTestPeek::fixed_difficulty_floor(fixture.session) == 0.0);
+    CHECK(fixture.conn.sent.size() == 1);
+    SessionTestPeek::set_retarget_window(fixture.session, 128);
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == doctest::Approx(initial_difficulty * 2.0));
+}
+
+TEST_CASE("network difficulty overrides a higher minimum for every password difficulty token") {
+    for (const std::string_view password : {"d=1000", "diff=1000", "diff_1000"}) {
+        CAPTURE(password);
+        Fixture fixture;
+        fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "1d00ffff");
+        fixture.pool.minimum_difficulty = 200.0;
+        fixture.pool.maximum_difficulty = 500.0;
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", password);
+
+        CHECK(fixture.session.difficulty() == 1.0);
+        const auto difficulty = fixture.conn.by_method("mining.set_difficulty");
+        REQUIRE(difficulty.has_value());
+        CHECK((*difficulty)["params"][0].get<double>() == 1.0);
+        CHECK(fixture.conn.by_method("mining.notify").has_value());
+        fixture.authorize("validaddr.worker", "d=0.5");
+        CHECK(fixture.session.difficulty() == 1.0);
+    }
+}
+
+TEST_CASE("initial and suggested difficulty stay within the network ceiling") {
+    const uint32_t curtime = static_cast<uint32_t>(std::time(nullptr));
+    FakePool pool{curtime};
+    pool.job = make_fake_job(curtime, 0x20000000, "1d00ffff");
+    pool.initial_difficulty = 64.0;
+    pool.minimum_difficulty = 200.0;
+    pool.maximum_difficulty = 500.0;
+    FakeConnection connection;
+    Session session{pool, connection, util::from_hex("e06ae06a")};
+    CHECK(session.difficulty() == 1.0);
+
+    session.handle_line(R"({"id":1,"method":"mining.subscribe","params":[]})");
+    session.handle_line(R"({"id":9,"method":"mining.suggest_difficulty","params":[1000]})");
+    const auto reply = connection.by_id(9);
+    REQUIRE(reply.has_value());
+    CHECK((*reply)["result"].get<bool>());
+    CHECK(session.difficulty() == 1.0);
+    session.send_set_difficulty();
+    const auto difficulty = connection.by_method("mining.set_difficulty");
+    REQUIRE(difficulty.has_value());
+    CHECK((*difficulty)["params"][0].get<double>() == 1.0);
+}
+
+TEST_CASE("a configured maximum below network difficulty still takes precedence") {
+    Fixture fixture;
+    fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "1d00ffff");
+    fixture.pool.minimum_difficulty = 0.001;
+    fixture.pool.maximum_difficulty = 0.5;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=1000");
+
+    CHECK(fixture.session.difficulty() == 0.5);
+    const auto difficulty = fixture.conn.by_method("mining.set_difficulty");
+    REQUIRE(difficulty.has_value());
+    CHECK((*difficulty)["params"][0].get<double>() == 0.5);
+}
+
+TEST_CASE("new jobs lower excessive difficulty before notifying fixed and ordinary miners") {
+    for (const bool fixed : {false, true}) {
+        CAPTURE(fixed);
+        for (const bool vardiff : {false, true}) {
+            CAPTURE(vardiff);
+            Fixture fixture;
+            fixture.pool.vardiff = vardiff;
+            fixture.subscribe();
+            fixture.session.handle_line(
+                R"({"id":9,"method":"mining.suggest_difficulty","params":[64]})");
+            fixture.authorize("validaddr.worker", fixed ? "d=64" : "x");
+            REQUIRE(fixture.session.difficulty() == 64.0);
+            if (fixed) {
+                const double now = SessionTestPeek::set_fixed_share_window(
+                    fixture.session, 60.0, 89);
+                SessionTestPeek::evaluate_fixed_share_window(fixture.session, now);
+                REQUIRE(SessionTestPeek::fixed_difficulty_floor(fixture.session) == 192.0);
+            }
+            fixture.pool.minimum_difficulty = 200.0;
+            fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "1d00ffff");
+            fixture.pool.job->set_publication_sequence(2);
+            fixture.conn.sent.clear();
+
+            fixture.session.send_notify(*fixture.pool.job, true);
+
+            CHECK(fixture.session.difficulty() == 1.0);
+            REQUIRE(fixture.conn.sent.size() == 2);
+            CHECK(fixture.conn.sent[0]["method"].get<std::string>() == "mining.set_difficulty");
+            CHECK(fixture.conn.sent[0]["params"][0].get<double>() == 1.0);
+            CHECK(fixture.conn.sent[1]["method"].get<std::string>() == "mining.notify");
+            CHECK(fixture.conn.sent[1]["params"][6].get<std::string>() == "1d00ffff");
+            fixture.conn.sent.clear();
+            for (const uint64_t shares : {uint64_t{128}, uint64_t{0}, uint64_t{128}}) {
+                SessionTestPeek::set_retarget_window(fixture.session, shares);
+                fixture.session.maybe_retarget();
+                CHECK(fixture.session.difficulty() == 1.0);
+                CHECK(fixture.conn.sent.empty());
+            }
+        }
+    }
+}
+
+TEST_CASE("a broadcast uses its own network ceiling rather than the pool current job") {
+    Fixture fixture;
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=64");
+    const auto incoming = make_fake_job(fixture.curtime, 0x20000000, "1d00ffff");
+    incoming->set_publication_sequence(2);
+    fixture.conn.sent.clear();
+
+    fixture.session.send_notify(*incoming, true);
+
+    CHECK(fixture.session.difficulty() == 1.0);
+    REQUIRE(fixture.conn.sent.size() == 2);
+    CHECK(fixture.conn.sent[0]["method"].get<std::string>() == "mining.set_difficulty");
+    CHECK(fixture.conn.sent[0]["params"][0].get<double>() == 1.0);
+    CHECK(fixture.conn.sent[1]["params"][6].get<std::string>() == "1d00ffff");
+    CHECK(fixture.pool.job->maximum_share_difficulty() > 64.0);
+    fixture.conn.sent.clear();
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == 1.0);
+    CHECK(fixture.conn.sent.empty());
+}
+
+TEST_CASE("fixed difficulty restores its request or rate floor when network difficulty rises") {
+    for (const bool raised_floor : {false, true}) {
+        CAPTURE(raised_floor);
+        Fixture fixture;
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", "d=64");
+        if (raised_floor) {
+            const double now = SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 89);
+            SessionTestPeek::evaluate_fixed_share_window(fixture.session, now);
+        }
+        const double expected = raised_floor ? 192.0 : 64.0;
+        REQUIRE(fixture.session.difficulty() == expected);
+        fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "1d00ffff");
+        fixture.pool.job->set_publication_sequence(2);
+        fixture.session.send_notify(*fixture.pool.job, true);
+        REQUIRE(fixture.session.difficulty() == 1.0);
+        CHECK(SessionTestPeek::fixed_difficulty_floor(fixture.session) ==
+              (raised_floor ? 192.0 : 0.0));
+        fixture.conn.sent.clear();
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == 1.0);
+        CHECK(fixture.conn.sent.empty());
+
+        fixture.pool.job = make_fake_job(fixture.curtime);
+        fixture.pool.job->set_publication_sequence(3);
+        fixture.session.send_notify(*fixture.pool.job, true);
+
+        CHECK(fixture.session.difficulty() == expected);
+        REQUIRE(fixture.conn.sent.size() == 2);
+        CHECK(fixture.conn.sent[0]["method"].get<std::string>() == "mining.set_difficulty");
+        CHECK(fixture.conn.sent[0]["params"][0].get<double>() == expected);
+        CHECK(fixture.conn.sent[1]["method"].get<std::string>() == "mining.notify");
+        fixture.conn.sent.clear();
+        fixture.session.maybe_retarget();
+        CHECK(fixture.session.difficulty() == expected);
+        CHECK(fixture.conn.sent.empty());
+    }
+}
+
+TEST_CASE("announced network ceilings preserve the exact block target") {
+    for (const std::string_view bits : {"1d00ffff", "1d00fffe", "1a123456", "207fffff",
+                                        "01010000"}) {
+        CAPTURE(bits);
+        Fixture fixture;
+        fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, bits);
+        fixture.subscribe();
+        fixture.authorize("validaddr.worker", "d=1e100");
+        const auto difficulty = fixture.conn.by_method("mining.set_difficulty");
+        REQUIRE(difficulty.has_value());
+        const double announced = (*difficulty)["params"][0].get<double>();
+        CHECK(announced == fixture.pool.job->maximum_share_difficulty());
+        CHECK(util::target_from_difficulty(announced) >= fixture.pool.job->network_target());
+    }
+}
+
+TEST_CASE("fixed rate increases cannot exceed the network difficulty") {
+    Fixture fixture;
+    fixture.pool.job = make_fake_job(fixture.curtime, 0x20000000, "1d00ffff");
+    fixture.subscribe();
+    fixture.authorize("validaddr.worker", "d=0.75");
+    const double now = SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 89);
+    SessionTestPeek::evaluate_fixed_share_window(fixture.session, now);
+    REQUIRE(fixture.session.difficulty() == 1.0);
+    CHECK(SessionTestPeek::fixed_difficulty_floor(fixture.session) == 1.0);
+    fixture.pool.minimum_difficulty = 200.0;
+    fixture.conn.sent.clear();
+
+    const double next = SessionTestPeek::set_fixed_share_window(fixture.session, 60.0, 89);
+    SessionTestPeek::evaluate_fixed_share_window(fixture.session, next);
+
+    CHECK(fixture.session.difficulty() == 1.0);
+    CHECK(fixture.conn.sent.empty());
+    fixture.session.maybe_retarget();
+    CHECK(fixture.session.difficulty() == 1.0);
+    CHECK(fixture.conn.sent.empty());
+    fixture.authorize("validaddr.worker", "d=1000");
+    CHECK(fixture.session.difficulty() == 1.0);
 }
 
 TEST_CASE("authorize allows an empty or absent worker name (address only)") {
@@ -403,7 +1229,7 @@ TEST_CASE("successful repeated authorization exhausts only that connection's con
 }
 
 TEST_CASE("shares bypass an empty control budget without replenishing it") {
-    Fixture fixture;
+    Fixture fixture{true};
     SessionTestPeek::freeze_control_refill(fixture.session);
     fixture.subscribe();
     fixture.authorize("validaddr.worker");
@@ -431,7 +1257,7 @@ TEST_CASE("shares bypass an empty control budget without replenishing it") {
 }
 
 TEST_CASE("a closing session still submits a block from the current read") {
-    Fixture fixture;
+    Fixture fixture{true};
     SessionTestPeek::freeze_control_refill(fixture.session);
     fixture.subscribe();
     fixture.authorize("validaddr.worker");
@@ -506,7 +1332,7 @@ TEST_CASE("submit to an unknown job is stale") {
 }
 
 TEST_CASE("a valid block share with mismatched username is dispatched, counted, and deduplicated") {
-    Fixture f;
+    Fixture f{true};
     f.subscribe();
     f.authorize("validaddr.w");
 
@@ -544,7 +1370,7 @@ TEST_CASE("a valid block share with mismatched username is dispatched, counted, 
 }
 
 TEST_CASE("omitted and zero version bits deduplicate when the header is unchanged") {
-    Fixture f;
+    Fixture f{true};
     SUBCASE("without version rolling") {}
     SUBCASE("with version rolling") { f.configure_mask("1fffe000"); }
     f.subscribe();
@@ -564,7 +1390,7 @@ TEST_CASE("omitted and zero version bits deduplicate when the header is unchange
 }
 
 TEST_CASE("mask renegotiation does not make the same header new work") {
-    Fixture f;
+    Fixture f{true};
     f.configure_mask("1fffe000");
     f.subscribe();
     f.authorize("validaddr.w");
@@ -584,8 +1410,8 @@ TEST_CASE("mask renegotiation does not make the same header new work") {
 }
 
 TEST_CASE("omitted version bits preserve rolled bits from the template") {
-    Fixture f;
-    f.pool.job = make_fake_job(f.curtime, 0x20002000);
+    Fixture f{true};
+    f.pool.job = make_fake_job(f.curtime, 0x20002000, "207fffff");
     f.configure_mask("1fffe000");
     f.subscribe();
     f.authorize("validaddr.w");
@@ -608,7 +1434,7 @@ TEST_CASE("omitted version bits preserve rolled bits from the template") {
 }
 
 TEST_CASE("invalid version bits cannot reserve the key of a valid block") {
-    Fixture f;
+    Fixture f{true};
     SUBCASE("without version rolling") {}
     SUBCASE("with version rolling") { f.configure_mask("1fffe000"); }
     f.subscribe();
@@ -753,12 +1579,15 @@ TEST_CASE("a difficulty change takes effect only from the next job (grace window
     f.authorize("validaddr.w");
     const Bytes enonce1 = util::from_hex("e06ae06a");
     const double start_diff = f.session.difficulty(); // clamped start difficulty
+    const double high = start_diff * 2.0;
 
-    // Three distinct accepted nonces (the regtest-easy network target accepts ~half), so each
-    // submit has its own dedup key without an intervening clean job.
-    std::vector<std::string> nonces;
+    std::string baseline_nonce;
+    std::string in_flight_nonce;
+    std::string harder_nonce;
     const Bytes coinbase2 = f.pool.job->build_coinbase2(kPayoutScript);
-    for (uint32_t n = 0; n < 4096 && nonces.size() < 3; ++n) {
+    for (uint32_t n = 0;
+         n < 4096 && (baseline_nonce.empty() || in_flight_nonce.empty() || harder_nonce.empty());
+         ++n) {
         const std::string nonce_hex = std::format("{:08x}", n);
         ShareInput in;
         in.coinbase2 = coinbase2;
@@ -768,10 +1597,19 @@ TEST_CASE("a difficulty change takes effect only from the next job (grace window
         in.nonce_hex = nonce_hex;
         in.share_target = util::target_from_difficulty(start_diff);
         in.now_unix = static_cast<int64_t>(std::time(nullptr));
-        if (f.pool.job->validate_share(in).has_value())
-            nonces.push_back(nonce_hex);
+        const auto result = f.pool.job->validate_share(in);
+        if (!result)
+            continue;
+        if (baseline_nonce.empty())
+            baseline_nonce = nonce_hex;
+        else if (in_flight_nonce.empty() && result->difficulty < high)
+            in_flight_nonce = nonce_hex;
+        else if (harder_nonce.empty() && result->difficulty >= high)
+            harder_nonce = nonce_hex;
     }
-    REQUIRE(nonces.size() == 3);
+    REQUIRE_FALSE(baseline_nonce.empty());
+    REQUIRE_FALSE(in_flight_nonce.empty());
+    REQUIRE_FALSE(harder_nonce.empty());
 
     const auto submit = [&](int id, const std::string& nonce) {
         f.conn.sent.clear();
@@ -781,33 +1619,27 @@ TEST_CASE("a difficulty change takes effect only from the next job (grace window
     };
 
     // Baseline: no pending change -> credited at the current difficulty.
-    submit(10, nonces[0]);
+    submit(10, baseline_nonce);
     CHECK((*f.conn.by_id(10))["result"].get<bool>() == true);
-    CHECK(f.pool.last_share_difficulty == doctest::Approx(start_diff));
+    CHECK(f.pool.last_share_difficulty == start_diff);
 
-    // Raise difficulty far above the share's actual difficulty, with NO new job. The in-flight
-    // share is still accepted and credited at the OLD difficulty -- not the new one.
-    const double high = start_diff * 1e6;
+    // An in-flight share retains its old difficulty until the next job.
     f.session.handle_line(
         std::format(R"({{"id":11,"method":"mining.suggest_difficulty","params":[{}]}})", high));
-    CHECK(f.session.difficulty() == doctest::Approx(high)); // advertised value changed immediately
-    submit(12, nonces[1]);
+    CHECK(f.session.difficulty() == high); // advertised value changed immediately
+    submit(12, in_flight_nonce);
     CHECK((*f.conn.by_id(12))["result"].get<bool>() == true); // accepted, not "above target"
-    CHECK(f.pool.last_share_difficulty == doctest::Approx(start_diff)); // credited the OLD difficulty
+    CHECK(f.pool.last_share_difficulty == start_diff); // credited the OLD difficulty
 
     // The next job ends the grace window; subsequent shares credit the NEW difficulty.
     f.session.send_notify(*f.pool.job, /*clean=*/true);
-    submit(13, nonces[2]);
+    submit(13, harder_nonce);
     CHECK((*f.conn.by_id(13))["result"].get<bool>() == true);
-    CHECK(f.pool.last_share_difficulty == doctest::Approx(high)); // credited the NEW difficulty
+    CHECK(f.pool.last_share_difficulty == high); // credited the NEW difficulty
 }
 
 TEST_CASE("difficulty-grace crediting: LOWER direction and the meets-the-harder-target branch") {
-    // The base grace test only RAISES, and every in-flight share credits the easier (lo) value.
-    // This drives a LOWER change (previous > new, so hi=previous, lo=new -- the min/max swap) and
-    // asserts BOTH credit branches: a share that meets the harder old target credits at hi, an
-    // easier one at lo. A low floor lets us put real share difficulties on both sides of hi (the
-    // default fixture clamps the start up to min_difficulty, leaving no room below it).
+    // Exercise both credit branches while a downward change is pending.
     struct LowFloorPool : FakePool {
         using FakePool::FakePool;
         std::shared_ptr<const RuntimeConfig> runtime_config() const override {
@@ -825,8 +1657,7 @@ TEST_CASE("difficulty-grace crediting: LOWER direction and the meets-the-harder-
     session.handle_line(R"({"id":1,"method":"mining.subscribe","params":["miner/1.0"]})");
     session.handle_line(R"({"id":3,"method":"mining.authorize","params":["validaddr.w","x"]})");
 
-    // Both difficulties stay above the target_from_difficulty 256-bit overflow floor (~2.3e-10) so
-    // the accept target is well-formed; the regtest-easy job yields share difficulties spanning hi.
+    // Both difficulties stay above the 256-bit target overflow floor (~2.3e-10).
     const double hi = session.difficulty(); // == clamped start (1e-9); becomes previous_ on the lower
     const double lo = 5e-10;                // the new (lower) difficulty
     REQUIRE(hi > lo);
@@ -865,7 +1696,7 @@ TEST_CASE("difficulty-grace crediting: LOWER direction and the meets-the-harder-
     // Lower the difficulty (hi -> lo) with NO new job: now pending, previous_=hi > difficulty_=lo.
     session.handle_line(
         std::format(R"({{"id":20,"method":"mining.suggest_difficulty","params":[{}]}})", lo));
-    REQUIRE(session.difficulty() == doctest::Approx(lo)); // advertised immediately
+    REQUIRE(session.difficulty() == lo); // advertised immediately
 
     const auto submit = [&](int id, const std::string& nonce) {
         conn.sent.clear();
@@ -878,12 +1709,12 @@ TEST_CASE("difficulty-grace crediting: LOWER direction and the meets-the-harder-
     // the `result.difficulty >= hi ? hi : lo` true branch the base test never reaches.
     submit(21, lucky);
     CHECK((*conn.by_id(21))["result"].get<bool>() == true);
-    CHECK(pool.last_share_difficulty == doctest::Approx(hi));
+    CHECK(pool.last_share_difficulty == hi);
 
     // A share that only meets the easier NEW target credits at lo.
     submit(22, easy);
     CHECK((*conn.by_id(22))["result"].get<bool>() == true);
-    CHECK(pool.last_share_difficulty == doctest::Approx(lo));
+    CHECK(pool.last_share_difficulty == lo);
 }
 
 TEST_CASE("a valid share clears the accumulated protocol-error budget") {
@@ -979,7 +1810,7 @@ TEST_CASE("suggest_difficulty adopts the clamped value and pushes set_difficulty
     const auto reply = f.conn.by_id(9);
     REQUIRE(reply.has_value());
     CHECK((*reply)["result"].get<bool>() == true);
-    CHECK(f.session.difficulty() == doctest::Approx(256.0)); // FakePool min 0.001, no max
+    CHECK(f.session.difficulty() == doctest::Approx(256.0));
     const auto setdiff = f.conn.by_method("mining.set_difficulty");
     REQUIRE(setdiff.has_value());
     CHECK((*setdiff)["params"][0].get<double>() == doctest::Approx(256.0));

@@ -95,6 +95,7 @@ Job::Job(std::string job_id, bitcoin::BlockTemplate block_template, ByteView tag
       bits_(block_template.bits),
       coinbase_value_(block_template.coinbase_value),
       network_target_(util::target_from_compact(block_template.bits)),
+      maximum_share_difficulty_(util::maximum_difficulty_for_target(network_target_)),
       prevhash_internal_(util::reversed(util::from_hex(block_template.previousblockhash))),
       prevhash_stratum_(prevhash_to_stratum(block_template.previousblockhash)),
       coinbase_sequence_(block_template.coinbase_sequence),

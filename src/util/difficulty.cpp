@@ -28,6 +28,8 @@ constexpr int kDoubleSignificandBits = kDoubleFractionBits + 1;
 constexpr unsigned kDifficultyOneShift = 208;
 using WideInteger = std::array<uint64_t, kWideWordCount>;
 
+enum class RatioRounding { Nearest, Down };
+
 WideInteger shift_left(const WideInteger& value, unsigned shift) {
     WideInteger shifted{};
     const std::size_t word_shift = shift / kWordBits;
@@ -108,7 +110,8 @@ WideInteger target_integer(const uint256& target) {
 }
 
 double exact_ratio_to_double(const WideInteger& numerator,
-                             const WideInteger& denominator) {
+                             const WideInteger& denominator,
+                             RatioRounding rounding = RatioRounding::Nearest) {
     // Integer scaling avoids double-rounding the 256-bit denominator.
     int exponent = bit_length(numerator) - bit_length(denominator);
     const bool initial_exponent_is_reachable =
@@ -135,8 +138,9 @@ double exact_ratio_to_double(const WideInteger& numerator,
 
     const WideInteger twice_remainder = shift_left(remainder, 1);
     const int remainder_comparison = compare(twice_remainder, divisor);
-    if (remainder_comparison > 0 ||
-        (remainder_comparison == 0 && (significand & 1) != 0))
+    if (rounding == RatioRounding::Nearest &&
+        (remainder_comparison > 0 ||
+         (remainder_comparison == 0 && (significand & 1) != 0)))
         ++significand;
 
     constexpr uint64_t kSignificandOverflow =
@@ -182,6 +186,17 @@ double difficulty_from_target(const uint256& target) {
 
 double difficulty_from_compact(uint32_t nbits) {
     return difficulty_from_target(target_from_compact(nbits));
+}
+
+double maximum_difficulty_for_target(const uint256& target) {
+    if (target.is_zero())
+        return std::numeric_limits<double>::infinity();
+    double difficulty = exact_ratio_to_double(difficulty_one_numerator(),
+                                              target_integer(target), RatioRounding::Down);
+    // Both difficulty and its round-trip target must stay on the easier side.
+    while (target_from_difficulty(difficulty) < target)
+        difficulty = std::nextafter(difficulty, 0.0);
+    return difficulty;
 }
 
 uint256 target_from_difficulty(double difficulty) {
