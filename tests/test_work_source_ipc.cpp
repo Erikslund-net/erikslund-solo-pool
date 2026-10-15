@@ -132,13 +132,21 @@ public:
     int primary_template_requests = 0;
     int backup_template_requests = 0;
 
+    void advance_time(double seconds) {
+        now_seconds_.fetch_add(seconds, std::memory_order_relaxed);
+    }
+
 protected:
+    double steady_now_seconds() const override {
+        return now_seconds_.load(std::memory_order_relaxed);
+    }
+
     std::string post_one(const Resolved& endpoint, const std::string& payload, long,
                          long* http_status) override {
         if (http_status)
             *http_status = 200;
         if (endpoint.url == "http://primary" && !primary_available)
-            throw RpcConnectionError("primary unavailable");
+            throw RpcConnectError("primary unavailable");
         if (payload.find("getbestblockhash") != std::string::npos)
             return R"({"result":")" + tip + R"(","error":null,"id":1})";
         if (payload.find("getblockchaininfo") != std::string::npos)
@@ -148,7 +156,7 @@ protected:
             if (endpoint.url == "http://primary") {
                 ++primary_template_requests;
                 if (!primary_template_available)
-                    throw RpcConnectionError("primary cannot serve a template");
+                    throw RpcConnectError("primary cannot serve a template");
             } else {
                 ++backup_template_requests;
             }
@@ -159,6 +167,9 @@ protected:
                    R"("mediantime":1700000000},"error":null,"id":1})";
         throw std::runtime_error("unexpected RPC request");
     }
+
+private:
+    std::atomic<double> now_seconds_{0.0};
 };
 
 class ReadinessRpc final : public RpcClient {
@@ -196,7 +207,7 @@ protected:
             if (!primary)
                 ++backup_readiness_requests;
             if (primary && primary_connection_error)
-                throw RpcConnectionError("primary peer query unavailable");
+                throw RpcConnectError("primary peer query unavailable");
             return R"({"result":)" + std::to_string(primary ? primary_connections : 1) +
                    R"(,"error":null,"id":1})";
         }
@@ -324,6 +335,9 @@ TEST_CASE("IpcWorkSource returns a valid failback template then resumes IPC") {
     rpc.primary_available = true;
     source.maybe_failback(rpc.tip);
     CHECK(rpc.active_index() == 1);
+    CHECK(rpc.primary_template_requests == 0);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
+    source.maybe_failback(rpc.tip);
 
     CHECK(source.fetch_template().previousblockhash == rpc.tip);
     CHECK(rpc.active_index() == 0);
@@ -352,6 +366,9 @@ TEST_CASE("a failed RPC failback candidate continues IPC without fetching from t
 
     rpc.primary_available = true;
     rpc.primary_template_available = false;
+    source.maybe_failback(rpc.tip);
+    CHECK(rpc.primary_template_requests == 0);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
     source.maybe_failback(rpc.tip);
 
     CHECK(source.fetch_template().previousblockhash == rpc.tip);

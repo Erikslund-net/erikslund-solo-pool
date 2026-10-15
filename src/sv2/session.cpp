@@ -480,9 +480,10 @@ void Session::open_channel_locked(uint32_t request_id, std::string_view user_ide
             kGroupChannelId}));
         issue_job_locked(opened_channel, current_job, true);
     }
-    log::info("Opened SV2 channel {} for {} (address={}, user_agent={})",
-              channel_id, connection_.peer(), opened_channel.address,
-              user_agent_);
+    if (const auto live_channel = channels_.find(channel_id); live_channel != channels_.end())
+        log::info("Opened SV2 channel {} for {} (address={}, user_agent={})",
+                  channel_id, connection_.peer(), live_channel->second.address,
+                  user_agent_);
 }
 
 void Session::handle_update_locked(const UpdateChannel& message) {

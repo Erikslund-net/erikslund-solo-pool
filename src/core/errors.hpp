@@ -28,4 +28,9 @@ struct RpcConnectionError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The endpoint could not be resolved or connected, before a request was sent.
+struct RpcConnectError : RpcConnectionError {
+    using RpcConnectionError::RpcConnectionError;
+};
+
 } // namespace erikslund

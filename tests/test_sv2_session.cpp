@@ -97,6 +97,8 @@ public:
         config.initial_difficulty = initial_difficulty;
         config.minimum_difficulty = minimum_difficulty;
         config.maximum_difficulty = maximum_difficulty;
+        if (maximum_difficulty_after_first_snapshot && runtime_config_snapshots++ != 0)
+            config.maximum_difficulty = *maximum_difficulty_after_first_snapshot;
         config.variable_difficulty = vardiff;
         config.vardiff_target_shares_per_minute = 1.0;
         config.vardiff_retarget_seconds = 0;
@@ -147,6 +149,8 @@ public:
     double initial_difficulty = 1e-9;
     double minimum_difficulty = 1e-12;
     double maximum_difficulty = 0.0;
+    std::optional<double> maximum_difficulty_after_first_snapshot;
+    mutable uint64_t runtime_config_snapshots = 0;
     bool vardiff = false;
     std::atomic<bool> pause_next_accepted{false};
     std::binary_semaphore accepted_entered{0};
@@ -992,6 +996,47 @@ TEST_CASE("SV2 closes only incompatible channels when the network target becomes
     CHECK(session.authorized());
     CHECK_FALSE(session.should_close());
     CHECK(session.protocol_errors() == 0);
+}
+
+TEST_CASE("SV2 channel opening survives a bound reload while initial work is built") {
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    for (const bool extended : {false, true}) {
+        CAPTURE(extended);
+        FakePool pool(now);
+        pool.initial_difficulty = 0.25;
+        pool.maximum_difficulty_after_first_snapshot = 0.125;
+        FakeConnection connection;
+        sv2::Session session(pool, connection, util::from_hex("01020304"));
+        setup(session, extended ? sv2::kSetupFlagRequiresVersionRolling
+                                : sv2::kSetupFlagRequiresStandardJobs);
+        connection.take_frames();
+        if (extended)
+            open_extended_channel(session, 7, 0.0F);
+        else
+            open_channel(session, 7, 0.0F);
+        const auto frames = connection.take_frames();
+        REQUIRE(frames.size() == 4);
+        CHECK(frames[0].message_type ==
+              (extended ? sv2::OpenExtendedMiningChannelSuccess::kMessageType
+                        : sv2::OpenStandardMiningChannelSuccess::kMessageType));
+        const sv2::U256 opened_target = extended
+            ? sv2::decode_open_extended_mining_channel_success(frames[0].payload).target
+            : sv2::decode_open_standard_mining_channel_success(frames[0].payload).target;
+        CHECK(util::uint256::from_le_bytes(opened_target) ==
+              util::target_from_difficulty(0.25));
+        REQUIRE(frames[1].message_type == sv2::SetTarget::kMessageType);
+        CHECK(util::uint256::from_le_bytes(
+                  sv2::decode_set_target(frames[1].payload).maximum_target) ==
+              util::target_from_difficulty(0.125));
+        CHECK(frames[2].message_type ==
+              (extended ? sv2::NewExtendedMiningJob::kMessageType
+                        : sv2::NewMiningJob::kMessageType));
+        CHECK(frames[3].message_type == sv2::SetNewPrevHash::kMessageType);
+        CHECK(session.authorized());
+        CHECK(session.stats().channels.size() == 1);
+        CHECK_FALSE(session.should_close());
+        CHECK(session.protocol_errors() == 0);
+    }
 }
 
 TEST_CASE("SV2 retargets every open Extended Channel") {

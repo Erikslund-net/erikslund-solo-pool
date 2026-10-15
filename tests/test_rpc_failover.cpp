@@ -3,7 +3,8 @@
 //   * bitcoin_nodes[0] is primary; the rest are failover, tried in order.
 //   * a connection failure advances to the next endpoint and STICKS there.
 //   * RPC errors are final except -9/-10/-28, which mean the endpoint is temporarily unavailable.
-//   * all endpoints down -> RpcConnectionError after trying each once.
+//   * connection failures skip the node for 30 seconds across all RPC paths.
+//   * cooled nodes remain a fallback when every eligible node fails.
 #include <doctest/doctest.h>
 
 #include <atomic>
@@ -34,13 +35,30 @@ std::string gbt_body(std::string_view previous_block_hash) {
            std::string(previous_block_hash) + R"(","transactions":[]},"error":null,"id":1})";
 }
 
+class TimedRpc : public RpcClient {
+public:
+    using RpcClient::RpcClient;
+
+    void advance_time(double seconds) {
+        now_seconds_.fetch_add(seconds, std::memory_order_relaxed);
+    }
+
+protected:
+    double steady_now_seconds() const override {
+        return now_seconds_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<double> now_seconds_{0.0};
+};
+
 // Drives call() without a network: each endpoint URL maps to a behaviour, and
 // every attempt is counted so tests can assert exactly which nodes were tried.
-class ScriptedRpc : public RpcClient {
+class ScriptedRpc : public TimedRpc {
 public:
-    enum class Mode { Ok, Down, WorkUnavailable, RpcErr };
+    enum class Mode { Ok, Down, Timeout, WorkUnavailable, RpcErr };
     explicit ScriptedRpc(const std::vector<RpcEndpoint>& endpoints)
-        : RpcClient(endpoints, /*timeout_seconds=*/1) {}
+        : TimedRpc(endpoints, /*timeout_seconds=*/1) {}
 
     std::map<std::string, Mode> mode; // url -> behaviour
     std::map<std::string, int> hits;  // url -> times call_one ran
@@ -54,7 +72,9 @@ protected:
         ++hits[endpoint.url];
         switch (mode.at(endpoint.url)) {
         case Mode::Down:
-            throw RpcConnectionError("down: " + endpoint.url);
+            throw RpcConnectError("down: " + endpoint.url);
+        case Mode::Timeout:
+            throw RpcConnectionError("read timed out: " + endpoint.url);
         case Mode::WorkUnavailable:
             throw RpcError("Bitcoin Core is not connected", -9);
         case Mode::RpcErr:
@@ -75,7 +95,9 @@ protected:
         const auto behavior = gbt_modes.find(endpoint.url);
         switch (behavior == gbt_modes.end() ? mode.at(endpoint.url) : behavior->second) {
         case Mode::Down:
-            throw RpcConnectionError("down: " + endpoint.url);
+            throw RpcConnectError("down: " + endpoint.url);
+        case Mode::Timeout:
+            throw RpcConnectionError("read timed out: " + endpoint.url);
         case Mode::WorkUnavailable:
             return R"({"result":null,"error":{"code":-9,"message":"Bitcoin Core is not connected!"},"id":1})";
         case Mode::RpcErr:
@@ -88,10 +110,10 @@ protected:
     }
 };
 
-class BlockingFailbackRpc final : public RpcClient {
+class BlockingFailbackRpc final : public TimedRpc {
 public:
     explicit BlockingFailbackRpc(const std::vector<RpcEndpoint>& endpoints)
-        : RpcClient(endpoints, 1), release_signal_(release_primary.get_future().share()) {}
+        : TimedRpc(endpoints, 1), release_signal_(release_primary.get_future().share()) {}
 
     std::atomic<bool> primary_available{false};
     std::atomic<int> backup_template_requests{0};
@@ -101,7 +123,7 @@ public:
 protected:
     glz::generic call_one(const Resolved& endpoint, const std::string&, long) override {
         if (endpoint.url == "http://primary" && !primary_available.load())
-            throw RpcConnectionError("primary unavailable");
+            throw RpcConnectError("primary unavailable");
         return glz::generic(kTip);
     }
 
@@ -193,6 +215,105 @@ TEST_CASE("all endpoints down raises RpcConnectionError after trying each exactl
     CHECK(rpc.hits["http://backup2"] == 1);
 }
 
+TEST_CASE("all cooled endpoints are retried immediately for mining work") {
+    ScriptedRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRpc::Mode::Down},
+                {"http://backup1", ScriptedRpc::Mode::Down},
+                {"http://backup2", ScriptedRpc::Mode::Down}};
+    CHECK_THROWS_AS(rpc.call("getblockcount"), RpcConnectionError);
+    SUBCASE("normal calls retry the recovered primary") {
+        rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+        CHECK(rpc.call("getblockcount")["served_by"].get<std::string>() == "http://primary");
+        CHECK(rpc.hits["http://primary"] == 2);
+    }
+    SUBCASE("parsed GBT retries the recovered primary") {
+        rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+        CHECK(rpc.getblocktemplate_parsed().height == 170);
+        CHECK(rpc.hits["http://primary"] == 2);
+    }
+    SUBCASE("direct mining tip probes retry their active endpoint") {
+        rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+        rpc.ok_result["chain"] = "regtest";
+        rpc.ok_result["blocks"] = 170.0;
+        rpc.ok_result["bestblockhash"] = kTip;
+        CHECK(rpc.get_mining_tip().hash == kTip);
+        CHECK(rpc.hits["http://primary"] == 2);
+    }
+    SUBCASE("one failed retry cannot sideline later cooled nodes") {
+        CHECK_THROWS_AS(rpc.call("getblockcount"), RpcConnectionError);
+        for (const auto& [url, hits] : rpc.hits)
+            CHECK(hits == 2);
+    }
+}
+
+TEST_CASE("normal calls rescue a cooled primary after every eligible backup fails") {
+    ScriptedRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRpc::Mode::Down},
+                {"http://backup1", ScriptedRpc::Mode::Ok},
+                {"http://backup2", ScriptedRpc::Mode::Ok}};
+    rpc.call("getblockcount");
+    rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+    rpc.mode["http://backup1"] = ScriptedRpc::Mode::Timeout;
+    rpc.mode["http://backup2"] = ScriptedRpc::Mode::Down;
+    SUBCASE("a failure to connect to the last live backup also rescues the primary") {
+        rpc.mode["http://backup1"] = ScriptedRpc::Mode::Down;
+    }
+    CHECK(rpc.call("getblockcount")["served_by"].get<std::string>() == "http://primary");
+    CHECK(rpc.active_index() == 0);
+    CHECK(rpc.hits["http://primary"] == 2);
+    CHECK(rpc.hits["http://backup1"] == 2);
+    CHECK(rpc.hits["http://backup2"] == 1);
+
+    rpc.mode["http://backup1"] = ScriptedRpc::Mode::Ok;
+    CHECK(rpc.call("getblockcount")["served_by"].get<std::string>() == "http://primary");
+    CHECK(rpc.hits["http://primary"] == 3);
+    CHECK(rpc.hits["http://backup1"] == 2);
+}
+
+TEST_CASE("failback respects connection cooldown without consuming its probe interval") {
+    ScriptedRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRpc::Mode::Down},
+                {"http://backup1", ScriptedRpc::Mode::Ok},
+                {"http://backup2", ScriptedRpc::Mode::Ok}};
+    rpc.call("getblockcount");
+    rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+    rpc.ok_result = kTip;
+
+    rpc.maybe_failback(kTip);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds - 1.0);
+    rpc.maybe_failback(kTip);
+    CHECK(rpc.hits["http://primary"] == 1);
+    rpc.advance_time(1.0);
+    rpc.maybe_failback(kTip);
+    CHECK(rpc.getblocktemplate_parsed().previousblockhash == kTip);
+    CHECK(rpc.active_index() == 0);
+    CHECK(rpc.hits["http://primary"] == 3);
+}
+
+TEST_CASE("failback discards a cached template when the primary becomes unreachable again") {
+    ScriptedRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRpc::Mode::Down},
+                {"http://backup1", ScriptedRpc::Mode::Ok},
+                {"http://backup2", ScriptedRpc::Mode::Ok}};
+    rpc.call("getblockcount");
+    REQUIRE(rpc.hits["http://primary"] == 1);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
+    rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+    rpc.ok_result = kTip;
+    rpc.maybe_failback(kTip);
+    REQUIRE(rpc.active_index() == 1);
+    REQUIRE(rpc.hits["http://primary"] == 3);
+
+    rpc.advance_time(RpcClient::kFailbackProbeSeconds);
+    rpc.mode["http://primary"] = ScriptedRpc::Mode::Down;
+    rpc.maybe_failback(kTip);
+    CHECK(rpc.hits["http://primary"] == 4);
+    CHECK(rpc.getblocktemplate_parsed().previousblockhash == kTip);
+    CHECK(rpc.active_index() == 1);
+    CHECK(rpc.hits["http://primary"] == 4);
+    CHECK(rpc.hits["http://backup1"] == 2);
+}
+
 TEST_CASE("failover is sticky: a recovered primary is not retried while the backup is healthy") {
     ScriptedRpc rpc(kEndpoints);
     rpc.mode = {{"http://primary", ScriptedRpc::Mode::Down},
@@ -229,6 +350,7 @@ TEST_CASE("maybe_failback prepares a primary GBT only after its tip catches up")
                 {"http://backup2", ScriptedRpc::Mode::Ok}};
     CHECK(rpc.call("getblockcount")["served_by"].get<std::string>() =="http://backup1"); // fail over
     REQUIRE(rpc.active_index() == 1);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
 
     SUBCASE("primary still down -> probe fails, stays on the backup") {
         rpc.maybe_failback(kTip); // first probe is immediate (no prior probe recorded)
@@ -304,6 +426,7 @@ TEST_CASE("a blocked failback GBT does not delay templates from the active backu
     rpc.call("getblockcount");
     REQUIRE(rpc.active_index() == 1);
     rpc.primary_available = true;
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
     auto primary_called = rpc.primary_called.get_future();
     auto recovery = std::async(std::launch::async, [&rpc] { rpc.maybe_failback(kTip); });
     const auto primary_status = primary_called.wait_for(1s);
@@ -346,13 +469,14 @@ TEST_CASE("from a backup, a fresh failure rotates and wraps to a recovered prima
     // backup1 dies, primary recovered: backup1 -> backup2(down) -> wrap -> primary.
     rpc.mode["http://backup1"] = ScriptedRpc::Mode::Down;
     rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok;
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
     CHECK(rpc.call("getblockcount")["served_by"].get<std::string>() =="http://primary");
     CHECK(rpc.hits["http://backup2"] == 1); // tried once on the wrap-around
 }
 
 namespace {
 
-class SubmitRpc : public RpcClient {
+class SubmitRpc : public TimedRpc {
 public:
     enum class Reply {
         Accepted,
@@ -361,11 +485,12 @@ public:
         Rejected,
         BadPreviousBlock,
         Down,
+        Timeout,
         RpcError
     };
 
     explicit SubmitRpc(const std::vector<RpcEndpoint>& endpoints)
-        : RpcClient(endpoints, /*timeout_seconds=*/1) {}
+        : TimedRpc(endpoints, /*timeout_seconds=*/1) {}
 
     std::map<std::string, Reply> replies;
 
@@ -393,7 +518,8 @@ protected:
         case Reply::Inconclusive: return glz::generic(std::string("inconclusive"));
         case Reply::Rejected: return glz::generic(std::string("high-hash"));
         case Reply::BadPreviousBlock: return glz::generic(std::string("bad-prevblk"));
-        case Reply::Down: throw RpcConnectionError("down: " + endpoint.url);
+        case Reply::Down: throw RpcConnectError("down: " + endpoint.url);
+        case Reply::Timeout: throw RpcConnectionError("read timed out: " + endpoint.url);
         case Reply::RpcError: throw erikslund::RpcError("submitblock denied", -22);
         }
         throw std::logic_error("unhandled submitblock reply");
@@ -404,10 +530,10 @@ private:
     std::map<std::string, int> hits_;
 };
 
-class BlockingSubmitRpc : public RpcClient {
+class BlockingSubmitRpc : public TimedRpc {
 public:
     explicit BlockingSubmitRpc(const std::vector<RpcEndpoint>& endpoints)
-        : RpcClient(endpoints, /*timeout_seconds=*/1),
+        : TimedRpc(endpoints, /*timeout_seconds=*/1),
           release_signal_(release_primary.get_future().share()) {}
 
     std::promise<void> primary_called;
@@ -415,17 +541,48 @@ public:
     std::promise<void> release_primary;
 
 protected:
-    glz::generic call_one(const Resolved& endpoint, const std::string&, long) override {
+    glz::generic call_one(const Resolved& endpoint, const std::string& payload, long) override {
+        const bool is_submission = payload.find("\"method\":\"submitblock\"") != std::string::npos;
         if (endpoint.url == "http://primary") {
+            if (!is_submission)
+                throw RpcConnectError("primary unavailable");
             primary_called.set_value();
             release_signal_.wait();
             throw RpcConnectionError("primary timed out");
         }
         if (endpoint.url == "http://backup1") {
-            backup_called.set_value();
+            if (is_submission)
+                backup_called.set_value();
             return glz::generic{};
         }
         return glz::generic(std::string("high-hash"));
+    }
+
+private:
+    std::shared_future<void> release_signal_;
+};
+
+class ConcurrentRecoveryRpc final : public TimedRpc {
+public:
+    explicit ConcurrentRecoveryRpc(const std::vector<RpcEndpoint>& endpoints)
+        : TimedRpc(endpoints, 1), release_signal_(release_old_success.get_future().share()) {}
+
+    std::promise<void> old_request_entered;
+    std::promise<void> release_old_success;
+    std::atomic<int> primary_requests{0};
+
+protected:
+    glz::generic call_one(const Resolved& endpoint, const std::string& payload, long) override {
+        if (endpoint.url == "http://primary") {
+            primary_requests.fetch_add(1, std::memory_order_relaxed);
+            if (payload.find("slow_success") != std::string::npos) {
+                old_request_entered.set_value();
+                release_signal_.wait();
+            } else if (payload.find("getblockchaininfo") != std::string::npos) {
+                throw RpcConnectError("new connection attempt failed");
+            }
+        }
+        return glz::generic{};
     }
 
 private:
@@ -466,6 +623,7 @@ TEST_CASE("submitblock does not change the active work endpoint") {
                    {"http://backup2", SubmitRpc::Reply::Rejected}};
     rpc.call("getblockcount");
     REQUIRE(rpc.active_index() == 1);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
 
     rpc.reset_hits();
     rpc.replies = {{"http://primary", SubmitRpc::Reply::Accepted},
@@ -476,6 +634,138 @@ TEST_CASE("submitblock does not change the active work endpoint") {
     CHECK(rpc.hit_count("http://backup1") == 1);
     CHECK(rpc.hit_count("http://backup2") == 1);
     CHECK(rpc.active_index() == 1);
+}
+
+TEST_CASE("submitblock skips a connection failure learned by another RPC path") {
+    SubmitRpc rpc(kEndpoints);
+    rpc.replies = {{"http://primary", SubmitRpc::Reply::Down},
+                   {"http://backup1", SubmitRpc::Reply::Accepted},
+                   {"http://backup2", SubmitRpc::Reply::Rejected}};
+    SUBCASE("normal calls share connection failures with submission") {
+        rpc.call("getblockcount");
+        CHECK(rpc.active_index() == 1);
+    }
+    SUBCASE("direct mining tip probes share connection failures with submission") {
+        CHECK_THROWS_AS(rpc.get_mining_tip(), RpcConnectionError);
+        CHECK(rpc.active_index() == 0);
+    }
+    const size_t work_endpoint = rpc.active_index();
+    rpc.reset_hits();
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hit_count("http://primary") == 0);
+    CHECK(rpc.hit_count("http://backup1") == 1);
+    CHECK(rpc.hit_count("http://backup2") == 1);
+    CHECK(rpc.active_index() == work_endpoint);
+}
+
+TEST_CASE("submitblock cooldown expires and a repeated failure starts a new interval") {
+    SubmitRpc rpc(kEndpoints);
+    rpc.replies = {{"http://primary", SubmitRpc::Reply::Down},
+                   {"http://backup1", SubmitRpc::Reply::Accepted},
+                   {"http://backup2", SubmitRpc::Reply::Rejected}};
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hit_count("http://primary") == 1);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds - 1.0);
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hit_count("http://primary") == 1);
+    rpc.advance_time(1.0);
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hit_count("http://primary") == 2);
+
+    rpc.replies["http://primary"] = SubmitRpc::Reply::Accepted;
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds - 1.0);
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hit_count("http://primary") == 2);
+    rpc.advance_time(1.0);
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hit_count("http://primary") == 3);
+    CHECK(rpc.active_index() == 0);
+}
+
+TEST_CASE("submission stays retryable when a cooled endpoint has not rejected the block") {
+    SubmitRpc rpc(kEndpoints);
+    rpc.replies = {{"http://primary", SubmitRpc::Reply::Down},
+                   {"http://backup1", SubmitRpc::Reply::Rejected},
+                   {"http://backup2", SubmitRpc::Reply::Rejected}};
+    CHECK_THROWS_AS(rpc.submitblock("00"), RpcConnectionError);
+    CHECK_THROWS_AS(rpc.submitblock("00"), RpcConnectionError);
+    CHECK(rpc.hit_count("http://primary") == 1);
+    CHECK(rpc.hit_count("http://backup1") == 2);
+    CHECK(rpc.hit_count("http://backup2") == 2);
+
+    SUBCASE("a valid duplicate still wins over a skipped endpoint") {
+        rpc.replies["http://backup1"] = SubmitRpc::Reply::Duplicate;
+        CHECK(rpc.submitblock("00") == "duplicate");
+    }
+    SUBCASE("inconclusive remains retryable with a skipped endpoint") {
+        rpc.replies["http://backup1"] = SubmitRpc::Reply::Inconclusive;
+        CHECK(rpc.submitblock("00") == "inconclusive");
+    }
+    SUBCASE("the recovered node can accept after cooldown") {
+        rpc.replies["http://primary"] = SubmitRpc::Reply::Accepted;
+        rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
+        CHECK_FALSE(rpc.submitblock("00").has_value());
+        CHECK(rpc.hit_count("http://primary") == 2);
+    }
+}
+
+TEST_CASE("all cooled submitblock endpoints are retried and keep the block retryable") {
+    SubmitRpc rpc(kEndpoints);
+    rpc.replies = {{"http://primary", SubmitRpc::Reply::Down},
+                   {"http://backup1", SubmitRpc::Reply::Down},
+                   {"http://backup2", SubmitRpc::Reply::Down}};
+    CHECK_THROWS_AS(rpc.submitblock("00"), RpcConnectionError);
+    CHECK_THROWS_AS(rpc.submitblock("00"), RpcConnectionError);
+    CHECK_THROWS_AS(rpc.call("getblockcount"), RpcConnectionError);
+    for (const auto& endpoint : kEndpoints)
+        CHECK(rpc.hit_count(endpoint.url) == 3);
+}
+
+TEST_CASE("submitblock can recover immediately when every endpoint is cooled") {
+    SubmitRpc rpc(kEndpoints);
+    rpc.replies = {{"http://primary", SubmitRpc::Reply::Down},
+                   {"http://backup1", SubmitRpc::Reply::Down},
+                   {"http://backup2", SubmitRpc::Reply::Down}};
+    CHECK_THROWS_AS(rpc.submitblock("00"), RpcConnectionError);
+    rpc.replies["http://primary"] = SubmitRpc::Reply::Accepted;
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    for (const auto& endpoint : kEndpoints)
+        CHECK(rpc.hit_count(endpoint.url) == 2);
+    CHECK(rpc.active_index() == 0);
+}
+
+TEST_CASE("submitblock rescues cooled endpoints without discarding an earlier unresolved response") {
+    SubmitRpc rpc(kEndpoints);
+    rpc.replies = {{"http://primary", SubmitRpc::Reply::Down},
+                   {"http://backup1", SubmitRpc::Reply::Rejected},
+                   {"http://backup2", SubmitRpc::Reply::Rejected}};
+    rpc.call("getblockcount");
+    rpc.replies["http://primary"] = SubmitRpc::Reply::Accepted;
+    rpc.replies["http://backup1"] = SubmitRpc::Reply::Timeout;
+    rpc.replies["http://backup2"] = SubmitRpc::Reply::Down;
+    SUBCASE("a recovered primary accepts after the backups fail") {
+        CHECK_FALSE(rpc.submitblock("00").has_value());
+        rpc.replies["http://backup1"] = SubmitRpc::Reply::Rejected;
+        CHECK_FALSE(rpc.submitblock("00").has_value());
+        CHECK(rpc.hit_count("http://primary") == 3);
+        CHECK(rpc.hit_count("http://backup2") == 1);
+    }
+    SUBCASE("a recovered primary rejection cannot make an earlier timeout final") {
+        rpc.replies["http://primary"] = SubmitRpc::Reply::Rejected;
+        CHECK_THROWS_AS(rpc.submitblock("00"), RpcConnectionError);
+        CHECK(rpc.hit_count("http://primary") == 2);
+    }
+    CHECK(rpc.active_index() == 1);
+}
+
+TEST_CASE("JSON-RPC submission errors do not trigger a connection cooldown") {
+    SubmitRpc rpc(kEndpoints);
+    rpc.replies = {{"http://primary", SubmitRpc::Reply::RpcError},
+                   {"http://backup1", SubmitRpc::Reply::Accepted},
+                   {"http://backup2", SubmitRpc::Reply::Rejected}};
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hit_count("http://primary") == 2);
 }
 
 TEST_CASE("submitblock retries unless every endpoint definitively rejects") {
@@ -528,25 +818,70 @@ TEST_CASE("a blocked submitblock endpoint does not delay another endpoint") {
     CHECK_FALSE(result.has_value());
 }
 
+TEST_CASE("a known dead node does not delay submitblock completion") {
+    using namespace std::chrono_literals;
+
+    BlockingSubmitRpc rpc(kEndpoints);
+    rpc.call("getblockcount");
+    REQUIRE(rpc.active_index() == 1);
+    auto primary_called = rpc.primary_called.get_future();
+    auto submission = std::async(std::launch::async, [&rpc] { return rpc.submitblock("00"); });
+    const auto submission_status = submission.wait_for(1s);
+    const auto primary_status = primary_called.wait_for(0s);
+    rpc.release_primary.set_value();
+    const auto result = submission.get();
+
+    CHECK(submission_status == std::future_status::ready);
+    CHECK(primary_status == std::future_status::timeout);
+    CHECK_FALSE(result.has_value());
+    CHECK(rpc.active_index() == 1);
+}
+
+TEST_CASE("an older concurrent success cannot clear a newer connection failure") {
+    using namespace std::chrono_literals;
+
+    ConcurrentRecoveryRpc rpc(kEndpoints);
+    auto entered = rpc.old_request_entered.get_future();
+    auto old_success = std::async(std::launch::async, [&rpc] { return rpc.call("slow_success"); });
+    const auto entered_status = entered.wait_for(1s);
+    CHECK_THROWS_AS(rpc.get_mining_tip(), RpcConnectionError);
+    rpc.release_old_success.set_value();
+    old_success.get();
+
+    CHECK(entered_status == std::future_status::ready);
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.primary_requests.load(std::memory_order_relaxed) == 2);
+    CHECK(rpc.active_index() == 0);
+}
+
 // The raw GBT path parses directly into a BlockTemplate before publishing a new active endpoint.
 namespace {
 
-class ScriptedRawRpc : public RpcClient {
+class ScriptedRawRpc : public TimedRpc {
 public:
-    enum class Mode { Ok, Down, NotConnected, InitialDownload, Warmup, RpcErr, Garbage };
+    enum class Mode { Ok, Down, Timeout, NotConnected, InitialDownload, Warmup,
+                      RpcErr, Garbage, MissingResult };
     explicit ScriptedRawRpc(const std::vector<RpcEndpoint>& endpoints)
-        : RpcClient(endpoints, /*timeout_seconds=*/1) {}
+        : TimedRpc(endpoints, /*timeout_seconds=*/1) {}
 
     std::map<std::string, Mode> mode;
     std::map<std::string, int> hits;
+    long response_status = 200;
 
 protected:
-    std::string post_one(const Resolved& endpoint, const std::string& /*payload*/, long /*timeout*/,
-                         long* /*http_status*/) override {
-        ++hits[endpoint.url];
+    std::string post_one(const Resolved& endpoint, const std::string& payload, long /*timeout*/,
+                         long* http_status) override {
+        {
+            const std::scoped_lock lock(mutex_);
+            ++hits[endpoint.url];
+        }
+        if (http_status)
+            *http_status = response_status;
         switch (mode.at(endpoint.url)) {
         case Mode::Down:
-            throw RpcConnectionError("down: " + endpoint.url);
+            throw RpcConnectError("down: " + endpoint.url);
+        case Mode::Timeout:
+            throw RpcConnectionError("read timed out: " + endpoint.url);
         case Mode::NotConnected:
             return R"({"result":null,"error":{"code":-9,"message":"Bitcoin Core is not connected!"},"id":1})";
         case Mode::InitialDownload:
@@ -557,11 +892,21 @@ protected:
             return R"({"result":null,"error":{"code":-22,"message":"invalid request"},"id":1})";
         case Mode::Garbage:
             return "not json at all";
+        case Mode::MissingResult:
+            return R"({"error":null,"id":1})";
         case Mode::Ok:
             break;
         }
+        if (payload.find("submitblock") != std::string::npos)
+            return R"({"result":null,"error":null,"id":1})";
+        if (payload.find("getblockchaininfo") != std::string::npos)
+            return R"({"result":{"chain":"regtest","blocks":170,"bestblockhash":")" +
+                   kTip + R"("},"error":null,"id":1})";
         return gbt_body(kTip);
     }
+
+private:
+    std::mutex mutex_;
 };
 
 } // namespace
@@ -576,6 +921,132 @@ TEST_CASE("getblocktemplate_parsed fails over a down primary and parses from the
     CHECK(tmpl.bits == 0x1d00ffffu);
     CHECK(tmpl.previousblockhash == std::string(64, 'a'));
     CHECK(rpc.active_index() == 1); // stuck on the backup, like call()
+}
+
+TEST_CASE("raw GBT connection failures share cooldown when another endpoint is available") {
+    ScriptedRawRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Down},
+                {"http://backup1", ScriptedRawRpc::Mode::Ok},
+                {"http://backup2", ScriptedRawRpc::Mode::Ok}};
+    CHECK(rpc.getblocktemplate_parsed().height == 170);
+    rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+    CHECK(rpc.getblocktemplate_parsed().height == 170);
+    CHECK(rpc.call("getblockcount")["height"].get<double>() == 170);
+    CHECK(rpc.get_mining_tip().hash == kTip);
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hits["http://primary"] == 1);
+    rpc.advance_time(RpcClient::kConnectionCooldownSeconds);
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hits["http://primary"] == 2);
+}
+
+TEST_CASE("single-node RPC operations retry immediately after a connection failure") {
+    ScriptedRawRpc rpc({kEndpoints.front()});
+    rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Down}};
+    SUBCASE("normal calls") {
+        CHECK_THROWS_AS(rpc.call("getblockcount"), RpcConnectionError);
+        rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+        CHECK(rpc.call("getblockcount")["height"].get<double>() == 170);
+    }
+    SUBCASE("parsed GBT") {
+        CHECK_THROWS_AS(rpc.getblocktemplate_parsed(), RpcConnectionError);
+        rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+        CHECK(rpc.getblocktemplate_parsed().height == 170);
+    }
+    SUBCASE("mining tip readiness") {
+        CHECK_THROWS_AS(rpc.get_mining_tip(), RpcConnectionError);
+        rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+        CHECK(rpc.get_mining_tip().hash == kTip);
+    }
+    SUBCASE("block submission") {
+        CHECK_THROWS_AS(rpc.submitblock("00"), RpcConnectionError);
+        rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+        CHECK_FALSE(rpc.submitblock("00").has_value());
+    }
+    CHECK(rpc.hits["http://primary"] == 2);
+}
+
+TEST_CASE("read timeouts do not cool RPC endpoints across work and submission paths") {
+    ScriptedRawRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Timeout},
+                {"http://backup1", ScriptedRawRpc::Mode::Ok},
+                {"http://backup2", ScriptedRawRpc::Mode::Ok}};
+    SUBCASE("normal calls") { rpc.call("getblockcount"); }
+    SUBCASE("parsed GBT") { rpc.getblocktemplate_parsed(); }
+    SUBCASE("mining tip readiness") {
+        CHECK_THROWS_AS(rpc.get_mining_tip(), RpcConnectionError);
+    }
+    SUBCASE("block submission") { CHECK_FALSE(rpc.submitblock("00").has_value()); }
+    REQUIRE(rpc.hits["http://primary"] == 1);
+    rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+    CHECK_FALSE(rpc.submitblock("00").has_value());
+    CHECK(rpc.hits["http://primary"] == 2);
+}
+
+TEST_CASE("all cooled raw GBT endpoints remain eligible after another connection failure") {
+    ScriptedRawRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Down},
+                {"http://backup1", ScriptedRawRpc::Mode::Down},
+                {"http://backup2", ScriptedRawRpc::Mode::Down}};
+    CHECK_THROWS_AS(rpc.getblocktemplate_parsed(), RpcConnectionError);
+    CHECK_THROWS_AS(rpc.getblocktemplate_parsed(), RpcConnectionError);
+    for (const auto& endpoint : kEndpoints)
+        CHECK(rpc.hits[endpoint.url] == 2);
+}
+
+TEST_CASE("parsed GBT rescues a cooled primary when eligible backups cannot provide work") {
+    ScriptedRawRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Down},
+                {"http://backup1", ScriptedRawRpc::Mode::Ok},
+                {"http://backup2", ScriptedRawRpc::Mode::Ok}};
+    CHECK(rpc.getblocktemplate_parsed().height == 170);
+    rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+    rpc.mode["http://backup1"] = ScriptedRawRpc::Mode::Timeout;
+    rpc.mode["http://backup2"] = ScriptedRawRpc::Mode::Down;
+    SUBCASE("a not-ready backup also allows the cooled primary to recover") {
+        rpc.mode["http://backup1"] = ScriptedRawRpc::Mode::Warmup;
+    }
+    CHECK(rpc.getblocktemplate_parsed().height == 170);
+    CHECK(rpc.active_index() == 0);
+    CHECK(rpc.hits["http://primary"] == 2);
+    CHECK(rpc.hits["http://backup1"] == 2);
+    CHECK(rpc.hits["http://backup2"] == 1);
+    rpc.mode["http://backup1"] = ScriptedRawRpc::Mode::Ok;
+    CHECK(rpc.getblocktemplate_parsed().height == 170);
+    CHECK(rpc.hits["http://primary"] == 3);
+    CHECK(rpc.hits["http://backup1"] == 2);
+}
+
+TEST_CASE("responding HTTP and JSON-RPC failures do not open the connection breaker") {
+    ScriptedRawRpc rpc({kEndpoints.front()});
+    SUBCASE("malformed JSON in the normal path") {
+        rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Garbage}};
+        CHECK_THROWS_AS(rpc.call("getblockcount"), RpcConnectionError);
+    }
+    SUBCASE("malformed GBT in the raw path") {
+        rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Garbage}};
+        CHECK_THROWS_AS(rpc.getblocktemplate_parsed(), RpcConnectionError);
+    }
+    SUBCASE("an HTTP authentication error with a non-JSON body") {
+        rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Garbage}};
+        rpc.response_status = 401;
+        CHECK_THROWS_AS(rpc.call("getblockcount"), RpcConnectionError);
+    }
+    SUBCASE("a JSON reply without a result") {
+        rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::MissingResult}};
+        CHECK_THROWS_AS(rpc.call("getblockcount"), RpcConnectionError);
+    }
+    SUBCASE("a JSON-RPC request rejection") {
+        rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::RpcErr}};
+        CHECK_THROWS_AS(rpc.call("getblockcount"), RpcError);
+    }
+    SUBCASE("a temporary Core availability error") {
+        rpc.mode = {{"http://primary", ScriptedRawRpc::Mode::Warmup}};
+        CHECK_THROWS_AS(rpc.getblocktemplate_parsed(), RpcConnectionError);
+    }
+    rpc.mode["http://primary"] = ScriptedRawRpc::Mode::Ok;
+    CHECK(rpc.getblocktemplate_parsed().height == 170);
+    CHECK(rpc.hits["http://primary"] == 2);
 }
 
 TEST_CASE("getblocktemplate_parsed treats an unparseable body like a down endpoint") {

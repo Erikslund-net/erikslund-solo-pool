@@ -106,6 +106,7 @@ RpcClient::RpcClient(const std::vector<RpcEndpoint>& endpoints, long timeout_sec
     }
     if (endpoints_.empty())
         throw std::invalid_argument("RpcClient: no endpoints configured");
+    endpoint_health_.resize(endpoints_.size());
 }
 
 RpcClient::RpcClient(std::string url, const std::string& user, const std::string& password,
@@ -134,27 +135,92 @@ glz::generic RpcClient::call(const std::string& method, const glz::generic& para
     return call_payload(make_payload(method, params), timeout > 0 ? timeout : timeout_);
 }
 
+double RpcClient::steady_now_seconds() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool RpcClient::endpoint_available(size_t index) {
+    const double now = steady_now_seconds();
+    const std::scoped_lock lock(endpoint_mutex_);
+    return now >= endpoint_health_[index].retry_after_seconds;
+}
+
+std::vector<bool> RpcClient::endpoint_eligibility() {
+    const double now = steady_now_seconds();
+    std::vector<bool> eligible(endpoints_.size());
+    {
+        const std::scoped_lock lock(endpoint_mutex_);
+        for (size_t index = 0; index < endpoints_.size(); ++index)
+            eligible[index] = now >= endpoint_health_[index].retry_after_seconds;
+    }
+    // Cooldown is a latency optimization, never a reason to disable every node.
+    if (std::ranges::none_of(eligible, [](bool available) { return available; }))
+        std::fill(eligible.begin(), eligible.end(), true);
+    return eligible;
+}
+
+void RpcClient::record_connection_failure(size_t index) {
+    const double retry_after = steady_now_seconds() + kConnectionCooldownSeconds;
+    const std::scoped_lock lock(endpoint_mutex_);
+    auto& health = endpoint_health_[index];
+    health.retry_after_seconds = std::max(health.retry_after_seconds, retry_after);
+    ++health.failure_sequence;
+}
+
+uint64_t RpcClient::connection_failure_sequence(size_t index) {
+    const std::scoped_lock lock(endpoint_mutex_);
+    return endpoint_health_[index].failure_sequence;
+}
+
+void RpcClient::record_connection_success(size_t index, uint64_t failure_sequence) {
+    const std::scoped_lock lock(endpoint_mutex_);
+    auto& health = endpoint_health_[index];
+    // A late success from an older request cannot undo a newer connection failure.
+    if (health.failure_sequence == failure_sequence)
+        health.retry_after_seconds = -std::numeric_limits<double>::infinity();
+}
+
+glz::generic RpcClient::call_endpoint(size_t index, const std::string& payload, long timeout) {
+    const auto failure_sequence = connection_failure_sequence(index);
+    try {
+        auto result = call_one(endpoints_[index], payload, timeout);
+        record_connection_success(index, failure_sequence);
+        return result;
+    } catch (const RpcError&) {
+        record_connection_success(index, failure_sequence);
+        throw;
+    } catch (const RpcConnectError&) {
+        record_connection_failure(index);
+        throw;
+    }
+}
+
 glz::generic RpcClient::call_payload(const std::string& payload, long timeout) {
     const size_t count = endpoints_.size();
     const size_t start = current_.load();
+    const auto eligible = endpoint_eligibility();
     std::string last_error;
-    for (size_t i = 0; i < count; ++i) {
-        const size_t index = (start + i) % count;
-        try {
-            glz::generic result = call_one(endpoints_[index], payload, timeout);
-            if (index != start) {
-                size_t expected = start;
-                if (current_.compare_exchange_strong(expected, index))
-                    log::warning("bitcoind RPC failed over to {}",
-                                 util::redact_url(endpoints_[index].url));
+    for (const bool retry_cooled : {false, true}) {
+        for (size_t offset = 0; offset < count; ++offset) {
+            const size_t index = (start + offset) % count;
+            if (eligible[index] == retry_cooled)
+                continue;
+            try {
+                glz::generic result = call_endpoint(index, payload, timeout);
+                if (index != start) {
+                    size_t expected = start;
+                    if (current_.compare_exchange_strong(expected, index))
+                        log::warning("bitcoind RPC failed over to {}",
+                                     util::redact_url(endpoints_[index].url));
+                }
+                return result;
+            } catch (const RpcError& error) {
+                if (!endpoint_unavailable(error))
+                    throw;
+                last_error = error.what();
+            } catch (const RpcConnectionError& error) {
+                last_error = error.what();
             }
-            return result;
-        } catch (const RpcError& error) {
-            if (!endpoint_unavailable(error))
-                throw;
-            last_error = error.what();
-        } catch (const RpcConnectionError& e) {
-            last_error = e.what();
         }
     }
     throw RpcConnectionError("all bitcoind endpoints unavailable: " + last_error);
@@ -188,8 +254,14 @@ std::string RpcClient::post_one(const Resolved& endpoint, const std::string& pay
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_status);
     curl_slist_free_all(headers);
 
-    if (curl_result != CURLE_OK)
-        throw RpcConnectionError(std::string("transport error: ") + curl_easy_strerror(curl_result));
+    if (curl_result != CURLE_OK) {
+        const std::string error = std::string("transport error: ") + curl_easy_strerror(curl_result);
+        if (curl_result == CURLE_COULDNT_CONNECT || curl_result == CURLE_COULDNT_RESOLVE_HOST ||
+            curl_result == CURLE_COULDNT_RESOLVE_PROXY)
+            throw RpcConnectError(error);
+        // A timeout may occur while reading a busy node's reply, so it must not trip cooldown.
+        throw RpcConnectionError(error);
+    }
     return response;
 }
 
@@ -221,7 +293,14 @@ std::string RpcClient::make_getblocktemplate_payload() {
 BlockTemplate RpcClient::fetch_template_from(size_t index, const std::string& payload,
                                             std::string& response_body) {
     long http_status = 0;
-    response_body = post_one(endpoints_[index], payload, poll_timeout_, &http_status);
+    const auto failure_sequence = connection_failure_sequence(index);
+    try {
+        response_body = post_one(endpoints_[index], payload, poll_timeout_, &http_status);
+        record_connection_success(index, failure_sequence);
+    } catch (const RpcConnectError&) {
+        record_connection_failure(index);
+        throw;
+    }
     try {
         return BlockTemplate::from_gbt(response_body);
     } catch (const std::invalid_argument& error) {
@@ -237,30 +316,35 @@ BlockTemplate RpcClient::getblocktemplate_parsed() {
     const std::string payload = make_getblocktemplate_payload();
     const size_t count = endpoints_.size();
     const size_t start = current_.load();
+    const auto eligible = endpoint_eligibility();
     std::string last_error;
 
-    for (size_t offset = 0; offset < count; ++offset) {
-        const size_t index = (start + offset) % count;
-        BlockTemplate block_template;
-        try {
-            block_template = fetch_template_from(index, payload, gbt_body_);
-        } catch (const RpcError& error) {
-            if (!endpoint_unavailable(error))
-                throw;
-            last_error = error.what();
-            continue;
-        } catch (const RpcConnectionError& e) {
-            last_error = e.what();
-            continue;
+    for (const bool retry_cooled : {false, true}) {
+        for (size_t offset = 0; offset < count; ++offset) {
+            const size_t index = (start + offset) % count;
+            if (eligible[index] == retry_cooled)
+                continue;
+            BlockTemplate block_template;
+            try {
+                block_template = fetch_template_from(index, payload, gbt_body_);
+            } catch (const RpcError& error) {
+                if (!endpoint_unavailable(error))
+                    throw;
+                last_error = error.what();
+                continue;
+            } catch (const RpcConnectionError& error) {
+                last_error = error.what();
+                continue;
+            }
+            // Only now is this endpoint proven to be serving work.
+            if (index != start) {
+                size_t expected = start;
+                if (current_.compare_exchange_strong(expected, index))
+                    log::warning("bitcoind RPC failed over to {}",
+                                 util::redact_url(endpoints_[index].url));
+            }
+            return block_template;
         }
-        // Only now is this endpoint proven to be serving work.
-        if (index != start) {
-            size_t expected = start;
-            if (current_.compare_exchange_strong(expected, index))
-                log::warning("bitcoind RPC failed over to {}",
-                             util::redact_url(endpoints_[index].url));
-        }
-        return block_template;
     }
     throw RpcConnectionError("all bitcoind endpoints unavailable for mining work: " + last_error);
 }
@@ -275,35 +359,41 @@ std::optional<std::string> RpcClient::submitblock(const std::string& block_hex) 
     payload += block_hex;
     payload += "\"]}";
 
-    std::vector<std::future<glz::generic>> responses;
-    responses.reserve(endpoints_.size());
-    for (size_t index = 0; index < endpoints_.size(); ++index) {
-        responses.push_back(std::async(std::launch::async, [this, index, &payload] {
-            return call_one(endpoints_[index], payload, timeout_);
-        }));
-    }
-
+    const auto eligible = endpoint_eligibility();
     bool accepted = false;
     bool already_known = false;
     std::optional<std::string> inconclusive;
     std::optional<std::string> first_rejection;
     std::exception_ptr first_error;
-    for (auto& response : responses) {
-        try {
-            const auto rejection = submitblock_rejection(response.get());
-            if (!rejection) {
-                accepted = true;
-            } else if (*rejection == "duplicate") {
-                already_known = true;
-            } else if (*rejection == "inconclusive" || *rejection == "duplicate-inconclusive") {
-                if (!inconclusive)
-                    inconclusive = rejection;
-            } else if (!first_rejection) {
-                first_rejection = rejection;
+    for (const bool retry_cooled : {false, true}) {
+        if (retry_cooled && (accepted || already_known || inconclusive || !first_error))
+            break;
+        std::vector<std::future<glz::generic>> responses;
+        responses.reserve(endpoints_.size());
+        for (size_t index = 0; index < endpoints_.size(); ++index) {
+            if (eligible[index] == retry_cooled)
+                continue;
+            responses.push_back(std::async(std::launch::async, [this, index, &payload] {
+                return call_endpoint(index, payload, timeout_);
+            }));
+        }
+        for (auto& response : responses) {
+            try {
+                const auto rejection = submitblock_rejection(response.get());
+                if (!rejection) {
+                    accepted = true;
+                } else if (*rejection == "duplicate") {
+                    already_known = true;
+                } else if (*rejection == "inconclusive" || *rejection == "duplicate-inconclusive") {
+                    if (!inconclusive)
+                        inconclusive = rejection;
+                } else if (!first_rejection) {
+                    first_rejection = rejection;
+                }
+            } catch (...) {
+                if (!first_error)
+                    first_error = std::current_exception();
             }
-        } catch (...) {
-            if (!first_error)
-                first_error = std::current_exception();
         }
     }
 
@@ -316,6 +406,8 @@ std::optional<std::string> RpcClient::submitblock(const std::string& block_hex) 
         return inconclusive;
     if (first_error)
         std::rethrow_exception(first_error);
+    if (std::ranges::any_of(eligible, [](bool available) { return !available; }))
+        throw RpcConnectionError("submitblock skipped endpoints in connection cooldown");
     if (first_rejection)
         return first_rejection;
     throw RpcConnectionError("submitblock received no endpoint response");
@@ -331,8 +423,11 @@ std::string RpcClient::getbestblockhash() {
 }
 
 MiningTip RpcClient::get_mining_tip() {
-    const Resolved& endpoint = endpoints_[current_.load()];
-    const auto info = call_one(endpoint, make_payload("getblockchaininfo"), poll_timeout_);
+    const size_t index = current_.load();
+    const auto eligible = endpoint_eligibility();
+    if (!eligible[index])
+        throw RpcConnectionError("bitcoind endpoint is in connection cooldown");
+    const auto info = call_endpoint(index, make_payload("getblockchaininfo"), poll_timeout_);
     if (!info.is_object() || !info.contains("chain") || !info["chain"].is_string() ||
         !info.contains("blocks") || !info["blocks"].is_number() ||
         !info.contains("bestblockhash") || !info["bestblockhash"].is_string())
@@ -352,7 +447,7 @@ MiningTip RpcClient::get_mining_tip() {
         if (info["initialblockdownload"].get<bool>())
             throw RpcError("Bitcoin Core is in initial block download", kRpcClientInInitialDownload);
         const auto connections =
-            call_one(endpoint, make_payload("getconnectioncount"), poll_timeout_);
+            call_endpoint(index, make_payload("getconnectioncount"), poll_timeout_);
         if (!connections.is_number() || connections.get<double>() < 1)
             throw RpcError("Bitcoin Core is not connected", kRpcClientNotConnected);
     }
@@ -360,17 +455,18 @@ MiningTip RpcClient::get_mining_tip() {
 }
 
 void RpcClient::maybe_failback(const std::string& expected_tip) {
-    if (current_.load() == 0 || expected_tip.empty())
-        return; // already on primary / no tip to compare against
-    const double now =
-        std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (current_.load() == 0 || expected_tip.empty() || !endpoint_available(0))
+        return;
+    const double now = steady_now_seconds();
     if (now - last_failback_probe_.load() < kFailbackProbeSeconds)
         return;
     last_failback_probe_.store(now);
     const std::string payload = make_payload("getbestblockhash");
     try {
-        const auto result = call_one(endpoints_[0], payload, poll_timeout_);
+        const auto result = call_endpoint(0, payload, poll_timeout_);
         if (!result.is_string() || result.get<std::string>() != expected_tip)
+            return;
+        if (!endpoint_available(0))
             return;
         // The status thread probes recovery without blocking work from the active node.
         std::string response_body;
@@ -391,7 +487,7 @@ std::optional<BlockTemplate> RpcClient::try_fetch_failback_template() {
         const std::scoped_lock lock(failback_mutex_);
         block_template = std::exchange(failback_template_, std::nullopt);
     }
-    if (!block_template || current_.load() == 0)
+    if (!block_template || current_.load() == 0 || !endpoint_available(0))
         return std::nullopt;
 
     try {

@@ -2082,6 +2082,7 @@ TEST_CASE("a lost reply followed by duplicate credits the block on the retry") {
     CHECK(PoolTestPeek::submit(pool, hash, kAddr)); // transport died -> retry requested
     CHECK(pool.blocks_found() == 0);                // nothing credited yet
     CHECK_FALSE(PoolTestPeek::submit(pool, hash, kAddr)); // retry sees "duplicate" -> terminal
+    CHECK(rpc.calls == 2);
     CHECK(pool.blocks_found() == 1);                      // credited exactly once
     CHECK(pool.snapshot().blocks_by_address.at(kAddr) == 1);
 }

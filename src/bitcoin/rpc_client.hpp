@@ -32,7 +32,7 @@ public:
                       long timeout = 0);
 
     BlockTemplate getblocktemplate_parsed();
-    // Send solved blocks to every node; acceptance or a valid duplicate from any node wins.
+    // Send solved blocks to every available node; acceptance or a valid duplicate wins.
     std::optional<std::string> submitblock(const std::string& block_hex);
     glz::generic validateaddress(const std::string& address);
     glz::generic getblockchaininfo();
@@ -53,6 +53,7 @@ public:
     void maybe_failback(const std::string& expected_tip);
     std::optional<BlockTemplate> try_fetch_failback_template();
     static constexpr double kFailbackProbeSeconds = 60.0;
+    static constexpr double kConnectionCooldownSeconds = 30.0;
 
     virtual ~RpcClient() = default;
 
@@ -65,16 +66,30 @@ protected:
                                   long timeout);
     virtual std::string post_one(const Resolved& endpoint, const std::string& payload, long timeout,
                                  long* http_status = nullptr);
+    virtual double steady_now_seconds() const;
 
 private:
+    struct EndpointHealth {
+        double retry_after_seconds = -std::numeric_limits<double>::infinity();
+        uint64_t failure_sequence = 0;
+    };
+
     std::string make_payload(const std::string& method,
                              const glz::generic& params = glz::generic{});
     glz::generic call_payload(const std::string& payload, long timeout);
+    glz::generic call_endpoint(size_t index, const std::string& payload, long timeout);
+    bool endpoint_available(size_t index);
+    std::vector<bool> endpoint_eligibility();
+    void record_connection_failure(size_t index);
+    uint64_t connection_failure_sequence(size_t index);
+    void record_connection_success(size_t index, uint64_t failure_sequence);
     std::string make_getblocktemplate_payload();
     BlockTemplate fetch_template_from(size_t index, const std::string& payload,
                                       std::string& response_body);
 
     std::vector<Resolved> endpoints_;
+    std::mutex endpoint_mutex_;
+    std::vector<EndpointHealth> endpoint_health_;
     std::atomic<size_t> current_{0};
     long timeout_;
     long connect_timeout_;
