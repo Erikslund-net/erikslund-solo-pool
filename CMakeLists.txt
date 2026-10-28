@@ -68,7 +68,7 @@ endif()
 set(FOUND_LIBATOMIC 1 CACHE INTERNAL "libatomic present (-latomic links)")
 find_package(CapnProto REQUIRED)
 # Generate raw Cap'n Proto C++ bindings from the vendored schema graph (docker/Dockerfile puts
-# mining/common/init.capnp + mp/proxy.capnp under /opt/ipc-schema). Raw `capnp compile` -- NOT
+# mining/common/init/echo/rpc.capnp + mp/proxy.capnp under /opt/ipc-schema). Raw `capnp compile` -- NOT
 # mpgen -- so the client links only libcapnp, no Bitcoin Core interface headers. The generated
 # units are third-party code; -w silences their warnings.
 set(IPC_SCHEMA_DIR /opt/ipc-schema)
@@ -76,23 +76,24 @@ set(IPC_GEN_DIR ${CMAKE_BINARY_DIR}/ipc_gen)
 file(MAKE_DIRECTORY ${IPC_GEN_DIR})
 # The method signatures use Proxy.Context / ThreadMap types from mp/proxy.capnp, so its bindings
 # (ipc_gen/mp/proxy.capnp.{h,c++}) must be generated too; the generated headers #include them.
+# Init also returns Echo and Rpc interfaces the client never calls, so their bindings are needed.
 set(IPC_GENERATED
     ${IPC_GEN_DIR}/mining.capnp.c++ ${IPC_GEN_DIR}/common.capnp.c++
-    ${IPC_GEN_DIR}/init.capnp.c++ ${IPC_GEN_DIR}/echo.capnp.c++
+    ${IPC_GEN_DIR}/init.capnp.c++ ${IPC_GEN_DIR}/echo.capnp.c++ ${IPC_GEN_DIR}/rpc.capnp.c++
     ${IPC_GEN_DIR}/mp/proxy.capnp.c++)
 set(IPC_GENERATED_HEADERS
     ${IPC_GEN_DIR}/mining.capnp.h ${IPC_GEN_DIR}/common.capnp.h
-    ${IPC_GEN_DIR}/init.capnp.h ${IPC_GEN_DIR}/echo.capnp.h
+    ${IPC_GEN_DIR}/init.capnp.h ${IPC_GEN_DIR}/echo.capnp.h ${IPC_GEN_DIR}/rpc.capnp.h
     ${IPC_GEN_DIR}/mp/proxy.capnp.h)
 add_custom_command(
     OUTPUT ${IPC_GENERATED} ${IPC_GENERATED_HEADERS}
     COMMAND ${CAPNP_EXECUTABLE} compile -o${CAPNPC_CXX_EXECUTABLE}:${IPC_GEN_DIR}
             --src-prefix=${IPC_SCHEMA_DIR} -I${IPC_SCHEMA_DIR} -I/usr/include
             ${IPC_SCHEMA_DIR}/mining.capnp ${IPC_SCHEMA_DIR}/common.capnp
-            ${IPC_SCHEMA_DIR}/init.capnp ${IPC_SCHEMA_DIR}/echo.capnp
+            ${IPC_SCHEMA_DIR}/init.capnp ${IPC_SCHEMA_DIR}/echo.capnp ${IPC_SCHEMA_DIR}/rpc.capnp
             ${IPC_SCHEMA_DIR}/mp/proxy.capnp
     DEPENDS ${IPC_SCHEMA_DIR}/mining.capnp ${IPC_SCHEMA_DIR}/common.capnp
-            ${IPC_SCHEMA_DIR}/init.capnp ${IPC_SCHEMA_DIR}/echo.capnp
+            ${IPC_SCHEMA_DIR}/init.capnp ${IPC_SCHEMA_DIR}/echo.capnp ${IPC_SCHEMA_DIR}/rpc.capnp
             ${IPC_SCHEMA_DIR}/mp/proxy.capnp
     COMMENT "capnp: generating Mining IPC C++ bindings")
 add_custom_target(generate_ipc_bindings DEPENDS ${IPC_GENERATED} ${IPC_GENERATED_HEADERS})
@@ -132,7 +133,7 @@ endif()
 find_library(MIMALLOC_LIBRARY mimalloc)
 
 # ---- vendored Bitcoin Core SHA-256 (MIT, third_party/bitcoin) ----------------
-# Verbatim from bitcoin/bitcoin v31.0; the fastest SHA-256 path is chosen at
+# Verbatim from bitcoin/bitcoin v32.1; the fastest SHA-256 path is chosen at
 # runtime. Each transform is compiled with the SIMD flags + ENABLE_* defines its
 # build expects; warnings are silenced (-w) as it is upstream code we don't edit.
 set(BTC_DIR ${CMAKE_SOURCE_DIR}/third_party/bitcoin)

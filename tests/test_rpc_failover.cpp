@@ -1107,3 +1107,30 @@ TEST_CASE("getblocktemplate_parsed reports all unavailable endpoints as a connec
     CHECK(rpc.hits["http://backup1"] == 1);
     CHECK(rpc.hits["http://backup2"] == 1);
 }
+
+TEST_CASE("the startup version check asks only the active node and never fails over") {
+    ScriptedRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRpc::Mode::RpcErr},
+                {"http://backup1", ScriptedRpc::Mode::Ok},
+                {"http://backup2", ScriptedRpc::Mode::Ok}};
+    SUBCASE("a refused call") {}
+    SUBCASE("an unreachable node") { rpc.mode["http://primary"] = ScriptedRpc::Mode::Down; }
+    SUBCASE("a reply without a version") { rpc.mode["http://primary"] = ScriptedRpc::Mode::Ok; }
+    CHECK_FALSE(rpc.active_node_version().has_value());
+    CHECK(rpc.active_index() == 0);
+    CHECK(rpc.hits["http://primary"] == 1);
+    CHECK(rpc.hits.count("http://backup1") == 0);
+}
+
+TEST_CASE("the startup version check reads the active node's getnetworkinfo version") {
+    ScriptedRpc rpc(kEndpoints);
+    rpc.mode = {{"http://primary", ScriptedRpc::Mode::Down},
+                {"http://backup1", ScriptedRpc::Mode::Ok},
+                {"http://backup2", ScriptedRpc::Mode::Ok}};
+    rpc.call("getblockcount");
+    REQUIRE(rpc.active_index() == 1);
+    rpc.ok_result = glz::generic::object_t{};
+    rpc.ok_result["version"] = 310100.0;
+    CHECK(rpc.active_node_version() == 310100);
+    CHECK(rpc.hits["http://primary"] == 1);
+}

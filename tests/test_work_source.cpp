@@ -4,11 +4,13 @@
 #include <doctest/doctest.h>
 
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
 #include <glaze/glaze.hpp>
 
+#include "bitcoin/node_version.hpp"
 #include "bitcoin/rpc_client.hpp"
 #include "bitcoin/work_source_rpc.hpp"
 #include "core/errors.hpp"
@@ -26,9 +28,17 @@ public:
     json header;    // getblockheader result
     json chaininfo; // getblockchaininfo result
     std::string tip = "0000tip";
+    std::optional<json> network_info; // getnetworkinfo result; absent = the call is refused
+    int network_info_calls = 0;
 
 protected:
     json call_one(const Resolved&, const std::string& payload, long) override {
+        if (payload.find("getnetworkinfo") != std::string::npos) {
+            ++network_info_calls;
+            if (!network_info)
+                throw RpcError("Method not found", -32601);
+            return *network_info;
+        }
         if (payload.find("getblockheader") != std::string::npos)
             return header;
         if (payload.find("getblockchaininfo") != std::string::npos)
@@ -102,6 +112,48 @@ TEST_CASE("RpcWorkSource maps chain info and the tip probe") {
     CHECK(info.chain == "main");
     CHECK(info.blocks == 850000);
     CHECK(source.get_tip() == "0000tip");
+}
+
+TEST_CASE("node versions format and parse at the 32.1.0 boundary") {
+    CHECK(bitcoin::kMinimumNodeVersion == 320100);
+    CHECK(bitcoin::format_node_version(320100) == "32.1.0");
+    CHECK(bitcoin::format_node_version(310100) == "31.1.0");
+    CHECK(bitcoin::format_node_version(329900) == "32.99.0");
+
+    const auto parse = [](std::string text) {
+        json info;
+        REQUIRE(!glz::read_json(info, text));
+        return bitcoin::node_version_from_network_info(info);
+    };
+    CHECK(parse(R"({"version":320100,"subversion":"/Satoshi:32.1.0/"})") == 320100);
+    CHECK(parse(R"({"version":310100})") == 310100);
+    CHECK_FALSE(parse(R"({})").has_value());
+    CHECK_FALSE(parse(R"({"version":"32.1.0"})").has_value());
+    CHECK_FALSE(parse(R"({"version":-1})").has_value());
+    CHECK_FALSE(parse(R"({"version":320100.5})").has_value());
+    CHECK_FALSE(parse(R"({"version":1e12})").has_value());
+    CHECK_FALSE(parse(R"([320100])").has_value());
+}
+
+TEST_CASE("startup only warns about a node older than 32.1 and never blocks on the check") {
+    CannedRpc rpc;
+    rpc.chaininfo = json::object_t{};
+    rpc.chaininfo["chain"] = std::string("main");
+    rpc.chaininfo["blocks"] = 850000.0;
+    SUBCASE("an older node") {
+        rpc.network_info = json::object_t{};
+        (*rpc.network_info)["version"] = 310100.0;
+    }
+    SUBCASE("a node that refuses getnetworkinfo") {}
+    SUBCASE("a reply without a version") { rpc.network_info = json::object_t{}; }
+    bitcoin::RpcWorkSource source(rpc);
+
+    const auto info = source.detect_chain();
+    CHECK(info.chain == "main");
+    CHECK(info.blocks == 850000);
+    CHECK(rpc.network_info_calls == 1);
+    CHECK(source.get_tip() == "0000tip");
+    CHECK(rpc.network_info_calls == 1);
 }
 
 TEST_CASE("RpcWorkSource::fetch_header extracts every field the fastblock gate needs") {

@@ -1,6 +1,6 @@
 # erikslund-solo-pool
 
-A modern C++ Bitcoin solo mining pool. It builds work from Bitcoin Core, validates
+A modern C++ Bitcoin (32.1+) solo mining pool. It builds work from Bitcoin Core, validates
 shares, and submits solved blocks. Stratum V1 is the default miner protocol;
 authenticated Stratum V2 Standard and Extended Channels are optional.
 

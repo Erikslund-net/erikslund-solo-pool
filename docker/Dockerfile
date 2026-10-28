@@ -105,10 +105,10 @@ RUN git clone --depth 1 --branch "${SECP256K1_VERSION}" \
     && ldconfig
 
 # Cap'n Proto + the Bitcoin Core Mining IPC schema graph for the CapnpMiningClient backend. apt ships
-# capnp/libcapnp; the Bitcoin Core schema (mining/common/init.capnp) is vendored from the pinned tag
+# capnp/libcapnp; the Bitcoin Core schema (mining/common/init/echo/rpc.capnp) is vendored from the pinned tag
 # and libmultiprocess supplies the /mp/proxy.capnp import. All land in /opt/ipc-schema so
 # `capnp compile -I/opt/ipc-schema` resolves the import graph (see CMakeLists.txt).
-ARG BITCOIN_IPC_REF=v31.1
+ARG BITCOIN_IPC_REF=v32.1
 RUN apt-get update && apt-get install -y --no-install-recommends capnproto libcapnp-dev \
     && git clone --depth 1 --branch "${BITCOIN_IPC_REF}" --filter=blob:none --sparse \
         https://github.com/bitcoin/bitcoin.git /tmp/btc \

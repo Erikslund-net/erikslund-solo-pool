@@ -107,10 +107,10 @@ RUN git clone --depth 1 --branch "${SECP256K1_VERSION}" \
     && ldconfig
 
 # ---- Cap'n Proto Mining IPC backend ------------------------------------------
-# The capnp toolchain (compiler + libcapnp-dev) + the Bitcoin Core v31 mining schema graph +
+# The capnp toolchain (compiler + libcapnp-dev) + the Bitcoin Core v32.1 mining schema graph +
 # libmultiprocess mp/proxy.capnp under /opt/ipc-schema, exactly as docker/Dockerfile does, so
 # CMake can `capnp compile -I/opt/ipc-schema`.
-ARG BITCOIN_IPC_REF=v31.1
+ARG BITCOIN_IPC_REF=v32.1
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends capnproto libcapnp-dev; \

@@ -2,7 +2,7 @@
 # Downloads the official Bitcoin Core release binary and verifies it against
 # the published SHA256SUMS before use.
 FROM debian:trixie-slim AS fetch
-ARG BTC_VERSION=31.1
+ARG BTC_VERSION=32.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates wget && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp

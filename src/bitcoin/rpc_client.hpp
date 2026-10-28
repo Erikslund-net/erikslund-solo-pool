@@ -44,6 +44,8 @@ public:
     glz::generic getchaintips();
     // Check readiness and read the tip from one endpoint; the caller handles fallback.
     MiningTip get_mining_tip();
+    // The active node's getnetworkinfo version, or nullopt if it cannot say. Never fails over.
+    std::optional<int64_t> active_node_version();
 
     size_t endpoint_count() const { return endpoints_.size(); }
 

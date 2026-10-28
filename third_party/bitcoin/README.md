@@ -1,7 +1,7 @@
 # Vendored from Bitcoin Core (MIT)
 
 These files are copied **verbatim and unmodified** from
-[bitcoin/bitcoin](https://github.com/bitcoin/bitcoin), tag **v31.0**, and are
+[bitcoin/bitcoin](https://github.com/bitcoin/bitcoin), tag **v32.1**, and are
 distributed under the MIT license (see the copyright header in each file, and
 Bitcoin Core's `COPYING`). MIT is compatible with this project's license.
 
@@ -13,7 +13,7 @@ crypto/sha256_x86_shani.cpp  crypto/sha256_arm_shani.cpp
 compat/cpuid.h  compat/endian.h  compat/byteswap.h
 attributes.h
 ```
-Source tree: <https://github.com/bitcoin/bitcoin/tree/v31.0/src>
+Source tree: <https://github.com/bitcoin/bitcoin/tree/v32.1/src>
 
 ## Updating
 

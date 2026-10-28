@@ -1,4 +1,5 @@
 # yaml-language-server: $schema=./pool.schema.json
+# Every node must run Bitcoin Core 32.1 or newer.
 bitcoin_nodes:
   - address: bitcoind:8332
     username: erikslund

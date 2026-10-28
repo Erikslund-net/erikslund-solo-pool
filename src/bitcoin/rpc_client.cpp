@@ -14,6 +14,7 @@
 #include <curl/curl.h>
 
 #include "bitcoin/network.hpp"
+#include "bitcoin/node_version.hpp"
 #include "core/errors.hpp"
 #include "core/logging.hpp"
 #include "util/hex.hpp"
@@ -235,6 +236,9 @@ std::string RpcClient::post_one(const Resolved& endpoint, const std::string& pay
     curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, endpoint.auth_header.c_str());
+    // libcurl sends "Expect: 100-continue" for bodies over 1 MiB and then waits a second for an
+    // interim reply; Bitcoin Core 32's HTTP server never sends one, which would delay submitblock.
+    headers = curl_slist_append(headers, "Expect:");
 
     curl_easy_setopt(curl, CURLOPT_URL, endpoint.url.c_str());
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
@@ -420,6 +424,15 @@ glz::generic RpcClient::validateaddress(const std::string& address) {
 
 std::string RpcClient::getbestblockhash() {
     return call("getbestblockhash", glz::generic{}, poll_timeout_).get<std::string>();
+}
+
+std::optional<int64_t> RpcClient::active_node_version() {
+    try {
+        return node_version_from_network_info(
+            call_endpoint(current_.load(), make_payload("getnetworkinfo"), poll_timeout_));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
 }
 
 MiningTip RpcClient::get_mining_tip() {

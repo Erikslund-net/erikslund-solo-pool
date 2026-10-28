@@ -4,7 +4,10 @@
 
 #include <glaze/glaze.hpp>
 
+#include "bitcoin/node_version.hpp"
 #include "core/errors.hpp"
+#include "core/logging.hpp"
+#include "util/url.hpp"
 
 namespace erikslund::bitcoin {
 
@@ -38,6 +41,11 @@ std::string require_str(glz::generic& obj, const char* key) {
 
 ChainInfo RpcWorkSource::detect_chain() {
     auto info = client_.getblockchaininfo();
+    const auto version = client_.active_node_version();
+    if (version && *version < kMinimumNodeVersion)
+        log::warning("bitcoind {} runs Bitcoin Core {}; {} or newer is required",
+                     util::redact_url(client_.endpoint_urls()[client_.active_index()]),
+                     format_node_version(*version), format_node_version(kMinimumNodeVersion));
     return ChainInfo{.chain = opt_str(info, "chain", "regtest"), .blocks = opt_int(info, "blocks", 0)};
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Live Bitcoin Core v31.1 IPC smoke test. The pool's RPC user cannot call getblocktemplate, so
+# Live Bitcoin Core v32.1 IPC smoke test. The pool's RPC user cannot call getblocktemplate, so
 # accepted work and recovery after restarting Core prove every template came through IPC.
 #
 # Run from the repository root:
@@ -22,7 +22,7 @@ BUILD_VOLUME=ep-ipc-smoke-build
 DATA_VOLUME=ep-ipc-smoke-data
 SOCKET_VOLUME=ep-ipc-smoke-socket
 MINING_ADDRESS=bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf
-POOL_RPC_METHODS=getblockchaininfo,getconnectioncount,getbestblockhash,getblockheader,getchaintips,submitblock
+POOL_RPC_METHODS=getnetworkinfo,getblockchaininfo,getconnectioncount,getbestblockhash,getblockheader,getchaintips,submitblock
 POOL_RPC_METHODS+=,getblockcount,getblockhash,getblock,getblockstats
 POOL_RPC_METHODS+=,createwallet,loadwallet,getnewaddress,sendtoaddress
 POOL_RPC_METHODS+=,generatetoaddress,getrawmempool
@@ -105,7 +105,7 @@ wait_for_job() {
 trap cleanup EXIT
 reset_resources
 
-echo "==> 1/9 build Bitcoin Core v31.1, the C++ pool, and the CPU test miner"
+echo "==> 1/9 build Bitcoin Core v32.1, the C++ pool, and the CPU test miner"
 docker build -q -t "$BITCOIND_IMAGE" -f "$REPO_ROOT/tools/regtest/Dockerfile.bitcoind" \
     "$REPO_ROOT/tools/regtest" >/dev/null
 docker build -q -t "$TOOLCHAIN_IMAGE" "$REPO_ROOT/docker" >/dev/null
@@ -117,7 +117,7 @@ docker run --rm -v "$REPO_ROOT:/src:ro" \
     "$TOOLCHAIN_IMAGE" >/tmp/erikslund-ipc-build.log 2>&1 ||
     { tail -40 /tmp/erikslund-ipc-build.log >&2; fail "C++ build or unit tests failed"; }
 
-echo "==> 2/9 start Bitcoin Core's v31.1 multiprocess node"
+echo "==> 2/9 start Bitcoin Core's v32.1 multiprocess node"
 docker network create "$NETWORK" >/dev/null
 docker volume create "$DATA_VOLUME" >/dev/null
 docker volume create "$SOCKET_VOLUME" >/dev/null

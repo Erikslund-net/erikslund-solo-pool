@@ -7,10 +7,12 @@
 #
 # Prerequisites:
 #   * Run a MULTIPROCESS bitcoin-node exposing the mining IPC socket. `bitcoin-node` ships in the
-#     official Bitcoin Core tarball. This build pins Bitcoin Core's v31.1 IPC schema, so use the
-#     matching Core release. Launch it via the wrapper:
+#     official Bitcoin Core tarball. This build pins Bitcoin Core's v32.1 IPC schema and needs
+#     Bitcoin Core 32.1 or newer. Launch it via the wrapper:
 #       bitcoin -m node -ipcbind=unix:/ipc/mining.sock
-#     Make that socket reachable from the C++ pool and point ipc_socket_path at it.
+#     Make that socket reachable from the C++ pool and point ipc_socket_path at it. Bitcoin Core
+#     also answers RPC on this socket without credentials, so share it only with the pool.
+#   * Use the same node as a bitcoin_nodes entry; IPC templates must match that node's tip.
 #
 # IPC reconnects every 30 seconds after startup or runtime failures.
 work_source: ipc
