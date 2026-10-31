@@ -60,7 +60,7 @@ RUN git clone --depth 1 --branch "${ERIKSLUND_HTTP_VERSION}" \
 
 # mimalloc (Microsoft): the interposed allocator. Built from a pinned release (like Glaze) instead
 # of the distro package -- installs libmimalloc.so + mimalloc.h to /usr/local (MI_INSTALL_TOPLEVEL).
-ARG MIMALLOC_VERSION=v3.6.0
+ARG MIMALLOC_VERSION=v3.6.1
 RUN git clone --depth 1 --branch "${MIMALLOC_VERSION}" https://github.com/microsoft/mimalloc.git /tmp/mimalloc \
     && cmake -S /tmp/mimalloc -B /tmp/mimalloc/build -DCMAKE_BUILD_TYPE=Release \
         -DMI_INSTALL_TOPLEVEL=ON -DMI_BUILD_TESTS=OFF \
